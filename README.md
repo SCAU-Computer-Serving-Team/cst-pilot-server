@@ -1,53 +1,39 @@
 # CST Pilot Server
 
-> CST Pilot 配套的服务端代码，定位是部署到队伍服务器，不随工具包发行。
+> CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测，存储在队伍服务器上。它回答一个问题：工具包实际用得怎么样。
 
-## 现状
+当前只含一个服务：遥测接收端（`src/telemetry/`）。数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`，本仓库改动接收逻辑时同步主仓库文档。
 
-截至 2026-10-03。
+## 收集什么
 
-| 项 | 状态 |
+只采工具包自身的运行信息，不采机主数据与对话内容。一场会话产生一条记录：
+
+| 类别 | 内容 |
 |---|---|
-| 遥测接收端 | 已实现，经 e2e 验证 |
-| 服务器部署（systemd + Caddy） | 未做 |
-| OAuth 内省接入 | 未做，身份解析用桩顶替，令牌格式 `stub-<mid>-<device>` |
-| members 导入、rollup 汇总导出、每日清理与备份 | 未做 |
+| 会话 | 起止时间、时长、活跃时长、提问与轮次数、起止原因、通道（TUI / Web） |
+| 模型 | 供应商、模型、思考档位、输入输出与缓存 token、估算费用与币种 |
+| 工具 | 工具名与子功能、调用次数、失败与降级次数、耗时、结果体积与截断次数 |
+| 上下文 | 压缩次数与规模、上下文峰值 |
+| 失败 | 供应商状态码、网络错误、取消次数 |
+| 环境 | 系统版本与架构、是否管理员、工具包版本 |
+| 身份（服务端补充） | 队员编号、设备标识、接收时间、来源 IP 网段 |
 
-## 组成
+## 不收集什么
 
-| 服务 | 位置 | 说明 |
-|---|---|---|
-| 遥测接收端 | `src/telemetry/` | 接收队员工具包上报的会话记录，存 SQLite。规格见主仓库 cst-pilot 的 `doc/telemetry/receiver/SPEC.md` |
+- 对话正文、系统提示词、模型输出
+- 工具参数值与输出正文：搜索词、URL、文件路径、命令正文
+- 会话名、计算机名、用户名
+- 模型凭据原文、硬件序列号
 
-## 运行
+## 报错原文的例外
 
-需要 Node.js 22.5 及以上（`node:sqlite`）。零 npm 依赖，无需安装。
+turn 级报错原文完整收集、不截断：它是定位供应商与网络故障的唯一依据，摘要会丢关键片段。这是契约中显式记录的唯一例外，代价由这一条例外单独承担。报错原文保留 180 天，之后从记录中删除。
 
-```bash
-# 常驻服务（默认 127.0.0.1:8787；身份解析用桩，令牌格式 stub-<mid>-<device>）
-node --experimental-strip-types src/telemetry/main.ts serve
+## 数据去向与保留
 
-# 导出会话明细 CSV
-node --experimental-strip-types src/telemetry/main.ts export-csv [out.csv]
+- 只落在队伍自己的服务器，不经任何第三方。
+- 会话记录长期保留；上传日志保留 90 天。
 
-# 手动重算 daily_rollup
-node --experimental-strip-types src/telemetry/main.ts rollup
+## 关闭
 
-# 按队员或设备删除记录
-node --experimental-strip-types src/telemetry/main.ts delete --mid M1024
-node --experimental-strip-types src/telemetry/main.ts delete --device <id>
-```
-
-环境变量：
-
-```
-TELEMETRY_PORT=8080
-TELEMETRY_HOST=127.0.0.1
-TELEMETRY_DB=/var/lib/cst-telemetry/telemetry.db
-OA_INTROSPECT_URL=https://cstoa.top/api/oauth/introspect   # 未配置时身份解析用桩
-OA_SERVICE_TOKEN=<接收端服务凭据>
-```
-
-## 契约与文档
-
-数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`。改动接收逻辑时同步主仓库文档，契约版本号一起改。
+工具包侧把 `agent/home/telemetry.json` 的 `enabled` 设为 `false`：不采集、不落盘、不联网。
