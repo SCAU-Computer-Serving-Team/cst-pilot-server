@@ -32,6 +32,10 @@ CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测�
 - 只落在队伍自己的服务器，不经任何第三方。
 - 会话记录长期保留；上传日志保留 90 天。
 
+## 待做
+
+- OAuth 内省接入：身份解析当前用桩（令牌格式 `stub-<mid>-<device>`）。OA 提供 `POST /api/oauth/introspect` 后，配置 `OA_INTROSPECT_URL` 与 `OA_SERVICE_TOKEN` 即切换为真内省，代码已就绪。
+
 ## 构建与运行
 
 Go + 纯 Go SQLite 驱动（modernc.org/sqlite），单二进制 11MB，常驻内存约 12MB（目标机是 2G 内存的 Linux）。
