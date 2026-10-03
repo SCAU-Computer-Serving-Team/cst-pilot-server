@@ -2,7 +2,7 @@
 
 CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测，存储在队伍服务器上。
 
-当前只含一个服务：遥测接收端（根目录 Go 源码，`server.go` / `store.go` / `auth.go` / `validate.go` / `main.go`）。数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`，本仓库改动接收逻辑时同步主仓库文档。
+当前只含一个服务：遥测接收端（`src/`）。数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`，本仓库改动接收逻辑时同步主仓库文档。
 
 ## 收集什么
 
@@ -25,7 +25,7 @@ CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测�
 - 会话名、计算机名、用户名
 - 模型凭据原文、硬件序列号
 
-例外：turn级的报错会完整收集。
+例外：turn 级的报错会完整收集。
 
 ## 数据去向与保留
 
@@ -34,11 +34,11 @@ CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测�
 
 ## 构建与运行
 
-Go + 纯 Go SQLite 驱动（modernc.org/sqlite），单二进制，常驻内存约 12MB。目标机是 2G 内存的 Linux，因此选编译型栈，不用 Node（同功能实测基线约 60-80MB）。
+Go + 纯 Go SQLite 驱动（modernc.org/sqlite），单二进制 11MB，常驻内存约 12MB（目标机是 2G 内存的 Linux）。
 
 ```bash
 # Windows 交叉编译 Linux 产物
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o telemetry-receiver .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o telemetry-receiver ./src
 
 # 常驻服务（默认 127.0.0.1:8787；身份解析用桩，令牌格式 stub-<mid>-<device>）
 TELEMETRY_PORT=8787 TELEMETRY_DB=/var/lib/cst-telemetry/telemetry.db ./telemetry-receiver serve
