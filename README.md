@@ -1,8 +1,8 @@
 # CST Pilot Server
 
-> CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测，存储在队伍服务器上。它回答一个问题：工具包实际用得怎么样。
+CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测，存储在队伍服务器上。
 
-当前只含一个服务：遥测接收端（`src/telemetry/`）。数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`，本仓库改动接收逻辑时同步主仓库文档。
+当前只含一个服务：遥测接收端（根目录 Go 源码，`server.go` / `store.go` / `auth.go` / `validate.go` / `main.go`）。数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`，本仓库改动接收逻辑时同步主仓库文档。
 
 ## 收集什么
 
@@ -25,15 +25,25 @@
 - 会话名、计算机名、用户名
 - 模型凭据原文、硬件序列号
 
-## 报错原文的例外
-
-turn 级报错原文完整收集、不截断：它是定位供应商与网络故障的唯一依据，摘要会丢关键片段。这是契约中显式记录的唯一例外，代价由这一条例外单独承担。报错原文保留 180 天，之后从记录中删除。
+例外：turn级的报错会完整收集。
 
 ## 数据去向与保留
 
 - 只落在队伍自己的服务器，不经任何第三方。
 - 会话记录长期保留；上传日志保留 90 天。
 
-## 关闭
+## 构建与运行
 
-工具包侧把 `agent/home/telemetry.json` 的 `enabled` 设为 `false`：不采集、不落盘、不联网。
+Go + 纯 Go SQLite 驱动（modernc.org/sqlite），单二进制，常驻内存约 12MB。目标机是 2G 内存的 Linux，因此选编译型栈，不用 Node（同功能实测基线约 60-80MB）。
+
+```bash
+# Windows 交叉编译 Linux 产物
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o telemetry-receiver .
+
+# 常驻服务（默认 127.0.0.1:8787；身份解析用桩，令牌格式 stub-<mid>-<device>）
+TELEMETRY_PORT=8787 TELEMETRY_DB=/var/lib/cst-telemetry/telemetry.db ./telemetry-receiver serve
+
+# 其余子命令：export-csv [out] | rollup | delete --mid <id> | delete --device <id>
+```
+
+环境变量：`TELEMETRY_PORT`、`TELEMETRY_HOST`、`TELEMETRY_DB`、`OA_INTROSPECT_URL`（未配置时用桩）、`OA_SERVICE_TOKEN`。

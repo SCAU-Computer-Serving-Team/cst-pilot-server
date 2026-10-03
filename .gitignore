@@ -1,4 +1,7 @@
 node_modules/
+*.exe
+*.amd64
+telemetry-receiver*
 *.db
 *.db-wal
 *.db-shm
