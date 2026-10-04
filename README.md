@@ -32,9 +32,9 @@ CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测�
 - 只落在队伍自己的服务器，不经任何第三方。
 - 会话记录长期保留；上传日志保留 90 天。
 
-## 待做
+## 身份解析
 
-- OAuth 内省接入：身份解析当前用桩（令牌格式 `stub-<mid>-<device>`）。OA 提供 `POST /api/oauth/introspect` 后，配置 `OA_INTROSPECT_URL` 与 `OA_SERVICE_TOKEN` 即切换为真内省，代码已就绪。
+OA 已提供 `POST /api/oauth/introspect`。生产配置 `OA_INTROSPECT_URL=http://127.0.0.1:8080/api/oauth/introspect` 与 `OA_SERVICE_TOKEN` 后，接收端会校验真实 Agent access token，返回 `active`、`mid`、`device_id` 和失效原因。未配置时仍可使用 `stub-<mid>-<device>` 进行本地联调。
 
 ## 构建与运行
 
