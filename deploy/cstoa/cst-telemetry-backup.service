@@ -2,7 +2,7 @@
 Description=CSTOA telemetry SQLite backup
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/cst-pilot-server/backup.py --database /var/lib/cst-telemetry/telemetry.db --output-dir /var/lib/cst-telemetry/backups
+ExecStart=/usr/bin/python3.11 /opt/cst-pilot-server/backup.py --database /var/lib/cst-telemetry/telemetry.db --output-dir /var/lib/cst-telemetry/backups
 User=root
 NoNewPrivileges=true
 ProtectSystem=strict

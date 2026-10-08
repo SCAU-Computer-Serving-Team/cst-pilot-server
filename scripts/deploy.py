@@ -72,6 +72,8 @@ def wait_health(site, root, version=None):
 
 
 def deployment(site, candidate):
+    if not hasattr(sqlite3.Connection, "backup"):
+        raise RuntimeError("Deployment requires Python 3.7+; use python3.11 on CSTOA")
     candidate = candidate.resolve()
     metadata = json.loads((candidate / "BUILD-INFO.json").read_text(encoding="utf-8-sig"))
     revision = metadata["revision"]

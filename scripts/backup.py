@@ -8,6 +8,8 @@ import sqlite3
 
 
 def backup(database, output, retention_days=30):
+    if not hasattr(sqlite3.Connection, "backup"):
+        raise RuntimeError("SQLite online backup requires Python 3.7 or newer")
     if retention_days < 1:
         raise ValueError("retention_days must be positive")
     if not database.is_file():

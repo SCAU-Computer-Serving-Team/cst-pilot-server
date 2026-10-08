@@ -17,7 +17,7 @@ Go 接收端由 `cst-telemetry.service` 托管，监听 `127.0.0.1:8787`。nginx
 构建与发布步骤见[发布说明](../../doc/release.md)。在服务器执行候选包中的更新程序：
 
 ```sh
-python3 /root/<候选目录>/deploy.py cstoa --candidate /root/<候选目录>
+python3.11 /root/<候选目录>/deploy.py cstoa --candidate /root/<候选目录>
 ```
 
 更新前执行在线一致性备份。程序以临时文件替换，再重启遥测服务；健康检查验证提交版本，检查已有会话和凭据保持不变。失败时恢复旧程序、服务配置并重启。
