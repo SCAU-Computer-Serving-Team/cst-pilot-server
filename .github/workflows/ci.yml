@@ -1,0 +1,25 @@
+name: Receiver CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Go format
+        run: test -z "$(gofmt -l src)"
+      - run: go vet ./...
+      - run: go test -race ./... -count=1 -timeout 60s
+      - run: python3 -m unittest discover -s scripts -p "test_*.py" -v
+      - name: Shell syntax
+        run: find deploy -name "*.sh" -exec sh -n {} \;
+      - name: Build Linux executable
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.buildVersion=${GITHUB_SHA}" -o /tmp/telemetry-receiver ./src

@@ -1,14 +1,16 @@
 // 遥测接收端 · 身份解析。
 //
-// OA 内省接口未实现前用桩顶替：令牌格式 stub-<mid>-<device_id> 直接解析；
-// OA_INTROSPECT_URL 配置后切换为真内省。结果按令牌 SHA-256 缓存 60 秒，只存内存。
+// 生产调用 OA 内省；测试身份须显式开启。正常结果缓存 60 秒，仅保存在内存。
 package main
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sync"
 	"time"
@@ -31,6 +33,7 @@ type introspectResult struct {
 type authOptions struct {
 	URL          string
 	ServiceToken string
+	AllowStub    bool
 }
 
 type introspector struct {
@@ -59,12 +62,15 @@ func (i *introspector) introspect(token string) introspectResult {
 	i.mu.Unlock()
 
 	var result introspectResult
-	if i.opts.URL == "" {
+	if i.opts.URL == "" && i.opts.AllowStub {
 		result = stubIntrospect(token)
 	} else {
 		result = remoteIntrospect(token, i.opts)
 	}
 
+	if result.err {
+		return result // 服务故障不缓存，恢复后立即允许重试。
+	}
 	i.mu.Lock()
 	if len(i.cache) > 512 {
 		i.cache = make(map[string]cachedResult)
@@ -85,7 +91,33 @@ func stubIntrospect(token string) introspectResult {
 	return introspectResult{active: true, identity: identity{MID: m[1], DeviceID: m[2]}}
 }
 
-var introspectClient = &http.Client{Timeout: 5 * time.Second}
+var introspectClient = &http.Client{
+	Timeout:       5 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+func validateAuthOptions(opts authOptions) error {
+	if opts.URL == "" {
+		if opts.AllowStub {
+			return nil
+		}
+		return fmt.Errorf("OA_INTROSPECT_URL is required; test mode requires TELEMETRY_ALLOW_STUB=1")
+	}
+	if opts.ServiceToken == "" {
+		return fmt.Errorf("OA_SERVICE_TOKEN is required")
+	}
+	u, err := url.Parse(opts.URL)
+	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" {
+		return fmt.Errorf("invalid OA_INTROSPECT_URL")
+	}
+	if u.Scheme == "https" {
+		return nil
+	}
+	if u.Scheme == "http" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" || u.Hostname() == "::1") {
+		return nil
+	}
+	return fmt.Errorf("OA_INTROSPECT_URL requires HTTPS or local loopback HTTP")
+}
 
 func remoteIntrospect(token string, opts authOptions) introspectResult {
 	body, err := jsonMarshal(map[string]string{"token": token})
@@ -105,16 +137,16 @@ func remoteIntrospect(token string, opts authOptions) introspectResult {
 		return introspectResult{err: true}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 500 {
+	if resp.StatusCode != http.StatusOK {
 		return introspectResult{err: true}
 	}
 	var payload struct {
-		Active    bool   `json:"active"`
-		MID       string `json:"mid"`
-		DeviceID  string `json:"device_id"`
-		Reason    string `json:"reason"`
+		Active   bool   `json:"active"`
+		MID      string `json:"mid"`
+		DeviceID string `json:"device_id"`
+		Reason   string `json:"reason"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&payload); err != nil {
 		return introspectResult{err: true}
 	}
 	if payload.Active && payload.MID != "" && payload.DeviceID != "" {

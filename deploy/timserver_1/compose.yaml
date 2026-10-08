@@ -1,0 +1,47 @@
+name: cst-pilot-telemetry
+services:
+  receiver:
+    build: .
+    image: cst-pilot-telemetry:${TELEMETRY_RELEASE:?configure release version}
+    stop_grace_period: 20s
+    restart: unless-stopped
+    environment:
+      TELEMETRY_HOST: 0.0.0.0
+      TELEMETRY_PORT: "8787"
+      TELEMETRY_DB: /data/telemetry.db
+      OA_INTROSPECT_URL: ${OA_INTROSPECT_URL:?configure OA introspection}
+      OA_SERVICE_TOKEN: ${OA_SERVICE_TOKEN:?configure service credential}
+    volumes:
+      - ./data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  gateway:
+    image: cst-pilot-telemetry:${TELEMETRY_RELEASE:?configure release version}
+    entrypoint: ["/usr/bin/caddy"]
+    command: ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    user: "65532:65532"
+    restart: unless-stopped
+    ports:
+      - "8445:8445"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./tls/server:/certs:ro
+    tmpfs:
+      - /data:uid=65532,gid=65532,mode=0700
+      - /config:uid=65532,gid=65532,mode=0700
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 64
+    depends_on:
+      receiver:
+        condition: service_healthy

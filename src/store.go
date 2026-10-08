@@ -245,7 +245,14 @@ const insertSessionSQL = `INSERT OR IGNORE INTO sessions (
 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 func (s *store) insertOne(tx *sql.Tx, row insertRow) (bool, error) {
-	p := row.payload
+	p := make(map[string]any, len(row.payload)+4)
+	for key, value := range row.payload {
+		p[key] = value
+	}
+	p["mid"] = row.mid
+	p["deviceId"] = row.deviceID
+	p["receivedAt"] = row.receivedAt
+	p["ip"] = row.ipNet
 	var costCny, costUsd, unpricedTurns float64
 	for _, model := range recordArray(p, "models") {
 		cost := num(model["cost"])
