@@ -7,6 +7,9 @@ telemetry-receiver*
 *.db-shm
 *.csv
 .env
+__pycache__/
+*.pyc
+release.env
 deploy/**/telemetry.env
 deploy/**/tls/
 deploy/**/data/

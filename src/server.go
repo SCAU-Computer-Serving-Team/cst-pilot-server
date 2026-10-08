@@ -62,7 +62,7 @@ func newTelemetryServer(opts serverOptions) *http.Server {
 			sendJSON(w, 500, errorBody("server_error", err.Error()))
 			return
 		}
-		sendJSON(w, 200, map[string]any{"ok": true, "sessions": sessions})
+		sendJSON(w, 200, map[string]any{"ok": true, "sessions": sessions, "version": buildVersion, "builtAt": buildTime})
 	})
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

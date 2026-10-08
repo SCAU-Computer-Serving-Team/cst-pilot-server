@@ -2,7 +2,8 @@ name: cst-pilot-telemetry
 services:
   receiver:
     build: .
-    image: cst-pilot-telemetry:20261008
+    image: cst-pilot-telemetry:${TELEMETRY_RELEASE:?configure release version}
+    stop_grace_period: 20s
     restart: unless-stopped
     environment:
       TELEMETRY_HOST: 0.0.0.0
@@ -23,7 +24,7 @@ services:
       timeout: 5s
       retries: 3
   gateway:
-    image: cst-pilot-telemetry:20261008
+    image: cst-pilot-telemetry:${TELEMETRY_RELEASE:?configure release version}
     entrypoint: ["/usr/bin/caddy"]
     command: ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     user: "65532:65532"

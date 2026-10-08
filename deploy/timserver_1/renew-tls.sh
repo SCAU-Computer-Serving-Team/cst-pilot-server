@@ -15,5 +15,5 @@ install -m 0640 "$TMP/server.key" "$SERVER/server.key"
 install -m 0644 "$TMP/server.crt" "$SERVER/server.crt"
 chown 0:65532 "$SERVER/server.key" "$SERVER/server.crt"
 if docker ps --format '{{.Names}}' | grep -q '^cst-pilot-telemetry-gateway-'; then
-  docker compose --env-file "$ROOT/telemetry.env" -f "$ROOT/compose.yaml" restart gateway
+  docker compose --env-file "$ROOT/telemetry.env" --env-file "$ROOT/release.env" -f "$ROOT/compose.yaml" restart gateway
 fi

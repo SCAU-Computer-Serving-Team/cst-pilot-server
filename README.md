@@ -1,61 +1,59 @@
 # CST Pilot Server
 
-CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测，存储在队伍服务器上。
+CST Pilot 的遥测接收端。客户端同时向 CSTOA 与 Tim 的 `timserver_1` 上传会话统计，两端独立存储、确认和去重。程序使用 Go 与纯 Go SQLite 驱动，编译为单个可执行文件。
 
-当前只含一个服务：遥测接收端（`src/`）。数据契约以主仓库 cst-pilot 为准：`doc/contract.md` 与 `doc/telemetry/`，本仓库改动接收逻辑时同步主仓库文档。
+## 收集与保留
 
-## 收集什么
-
-只采工具包自身的运行信息，不采机主数据与对话内容。一场会话产生一条记录：
+字段定义以主仓库 [信息收集契约](https://github.com/SCAU-Computer-Serving-Team/cst-pilot/blob/main/doc/contract.md) 和 [遥测规格](https://github.com/SCAU-Computer-Serving-Team/cst-pilot/tree/main/doc/telemetry) 为准。
 
 | 类别 | 内容 |
 |---|---|
-| 会话 | 起止时间、时长、活跃时长、提问与轮次数、起止原因、通道（TUI / Web） |
-| 模型 | 供应商、模型、思考档位、输入输出与缓存 token、估算费用与币种 |
-| 工具 | 工具名与子功能、调用次数、失败与降级次数、耗时、结果体积与截断次数 |
-| 上下文 | 压缩次数与规模、上下文峰值 |
-| 失败 | 供应商状态码、网络错误、取消次数 |
-| 环境 | 系统版本与架构、是否管理员、工具包版本 |
-| 身份（服务端补充） | 队员编号、设备标识、接收时间、来源 IP 网段 |
+| 会话 | 起止、时长、提问与模型往返、TUI/Web、结束原因 |
+| 模型 | 供应商、模型、思考档位、token、估算费用与币种 |
+| 工具 | 名称与子功能、调用、失败、降级、耗时和输出体积 |
+| 上下文与环境 | 压缩、峰值、系统版本、架构、管理员权限 |
+| 异常 | 网络错误、供应商状态、取消、模型调用报错原文 |
+| 服务端身份 | OA 内省取得的学号、设备标识、接收时间和来源网段 |
 
-## 不收集什么
+正常字段不收对话、系统提示词、模型输出、工具参数与输出正文、路径、用户名或模型凭据。模型调用报错原文为例外，可能包含敏感片段。
 
-- 对话正文、系统提示词、模型输出
-- 工具参数值与输出正文：搜索词、URL、文件路径、命令正文
-- 会话名、计算机名、用户名
-- 模型凭据原文、硬件序列号
+会话统计长期保留，报错原文 180 天后移除，上传日志保留 90 天。服务启动时和每 24 小时执行清理与汇总。数据只落在上述两个接收端。
 
-例外：turn 级的报错会完整收集。
+## 接口与身份
 
-## 数据去向与保留
+| 接口 | 用途 |
+|---|---|
+| `POST /v1/sessions` | OA Agent 令牌鉴权、批量校验、入库，按 `recordId` 去重 |
+| `GET /healthz` | 健康、会话条数、提交版本与构建时间 |
 
-- 同时落在 CSTOA 服务器与 Tim 的 `timserver_1`，不经过第三方数据接收服务。
-- 会话记录长期保留；上传日志保留 90 天。
+生产须配置 `OA_INTROSPECT_URL` 与 `OA_SERVICE_TOKEN`。内省使用 HTTPS，或本机回环 HTTP；不跟随重定向。服务故障返回 503 且不缓存故障，令牌无效返回 401/403。身份字段在数据库列和原始 `payload` 中均来自验证结果。
+
+本地测试身份须显式设置 `TELEMETRY_ALLOW_STUB=1`，生产不启用。
 
 ## 部署
 
-| 接收端 | 地址 | 身份与运行 |
+| 接收端 | 上报入口 | 管理方式 |
 |---|---|---|
-| CSTOA | `https://www.cstoa.top/api/telemetry` | systemd、nginx、真实 OA 内省 |
-| Tim | `https://8.163.28.9:8445/api/telemetry` | 独立 Docker Compose、专用 CA、真实 OA 内省，见[部署说明](deploy/timserver_1/README.md) |
+| CSTOA | `https://www.cstoa.top/api/telemetry` | systemd、nginx，[部署说明](deploy/cstoa/README.md) |
+| Tim | `https://8.163.28.9:8445/api/telemetry` | 独立 Docker Compose、专用 CA，[部署说明](deploy/timserver_1/README.md) |
 
-客户端同时向两端发送同一会话记录，两端分别存储、确认和去重。真实队员登录上传、异机备份及完整恢复演练待验收。
-## 身份解析
+两端均使用真实 OA 内省和每日在线 SQLite 备份。服务密钥与 TLS 私钥只在服务器保存，不进入仓库、镜像构建上下文或发行包。
 
-OA 已提供 `POST /api/oauth/introspect`。生产配置内省地址与服务凭据，接收端据此校验真实 Agent 令牌并取得学号、设备标识和失效原因。CSTOA 使用本机地址，Tim 使用 OA 的公开 HTTPS 地址。
+发布、版本核对与回退见[发布说明](doc/release.md)。异机备份、完整恢复和真实队员双端成功入库须独立验收。
 
-## 构建与运行
+## 开发
 
-Go + 纯 Go SQLite 驱动（modernc.org/sqlite），单二进制 11MB，常驻内存约 12MB（目标机是 2G 内存的 Linux）。
-
-```bash
-# Windows 交叉编译 Linux 产物
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o telemetry-receiver ./src
-
-# 常驻服务（生产须配置 OA 内省地址与服务凭据）
-TELEMETRY_PORT=8787 TELEMETRY_DB=/var/lib/cst-telemetry/telemetry.db OA_INTROSPECT_URL=https://www.cstoa.top/api/oauth/introspect OA_SERVICE_TOKEN=<服务凭据> ./telemetry-receiver serve
-
-# 其余子命令：export-csv [out] | rollup | delete --mid <id> | delete --device <id>
+```powershell
+go test ./... -count=1 -timeout 30s
+go vet ./...
+python -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-环境变量：`TELEMETRY_PORT`、`TELEMETRY_HOST`、`TELEMETRY_DB`、`OA_INTROSPECT_URL`（未配置时用桩）、`OA_SERVICE_TOKEN`。
+| 目录 | 职责 |
+|---|---|
+| `src/` | 接收、身份验证、存储、汇总、保留期与 Go 测试 |
+| `scripts/` | 构建发布包、更新已有部署、SQLite 备份及测试 |
+| `deploy/` | 两个服务器的程序配置、定时任务和运维说明 |
+| `doc/` | 发布与验证规则 |
+
+命令：`serve`、`version`、`export-csv [out]`、`rollup`、`delete --mid <学号>`、`delete --device <设备>`。导出与删除需要显式设置 `TELEMETRY_DB`，删除只用于经过确认的运维操作。

@@ -1,0 +1,21 @@
+[Unit]
+Description=CST telemetry receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=csttele
+Group=csttele
+ExecStart=/opt/cst-pilot-server/telemetry-receiver serve
+EnvironmentFile=/opt/cst-pilot-server/telemetry.env
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/cst-telemetry
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

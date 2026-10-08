@@ -16,17 +16,16 @@
 
 ## 部署
 
-1. 将本目录中的部署文件和已验证的 Linux 二进制复制到 `/srv/cst-pilot-server`，二进制命名 `telemetry-receiver`。`.dockerignore` 只允许二进制与 Dockerfile 进入构建上下文。
-2. 执行 `sh prepare.sh`。它创建数据目录、专用 CA 与服务证书，并安装备份和证书定时任务。
-3. 配置 `telemetry.env`，参考示例文件。权限设为 `0600`，不要提交服务凭据。
-4. 启动并核查：
+部署和更新采用[发布说明](../../doc/release.md)中的提交版本构建包。`telemetry.env` 只保存 OA 配置；`release.env` 保存 `TELEMETRY_RELEASE`，两者都在服务器本地保存。
 
 ```sh
 cd /srv/cst-pilot-server
-docker compose --env-file telemetry.env up -d --build --wait
-docker compose --env-file telemetry.env ps
+docker compose --env-file telemetry.env --env-file release.env up -d --build --wait
+docker compose --env-file telemetry.env --env-file release.env ps
 curl --cacert tls/ca/ca.crt https://8.163.28.9:8445/healthz
 ```
+
+更新脚本会先备份 SQLite 和旧程序、验证新版本，再保留或回退。更新不重建专用 CA，也不替换服务凭据。
 
 两个容器使用非 root 用户、只读根文件系统、删除全部 Linux capabilities，并设置失败重启。Go 进程与网关分别限制 64 MiB 内存。
 
@@ -43,12 +42,12 @@ CA 有效期 10 年。客户端只对 Tim 上报端点使用此 CA，并继续�
 
 ## 备份与维护
 
-`cst-telemetry-backup.timer` 每日 03:45 执行在线一致性备份，保留 30 天。备份在 `/srv/cst-pilot-server/backups`，并执行 SQLite `quick_check`。同机备份不覆盖整机或磁盘丢失，异机备份与完整恢复演练待完成。
+`cst-telemetry-backup.timer` 每日 03:45 执行在线一致性备份，保留 30 天。备份保存在 `/srv/cst-pilot-server/backups`，并执行 SQLite `quick_check`。脚本位于仓库 `scripts/backup.py`，构建包将它复制到部署根目录。同机备份不覆盖整机或磁盘丢失，异机备份与完整恢复演练待完成。
 
 ```sh
 systemctl start cst-telemetry-backup.service
 systemctl list-timers --all | grep cst-telemetry
-docker compose --env-file telemetry.env logs --tail 50
+docker compose --env-file telemetry.env --env-file release.env logs --tail 50
 ```
 
 Go 服务自身在启动和每 24 小时执行一次保留期清理、每日汇总。
@@ -57,7 +56,7 @@ Go 服务自身在启动和每 24 小时执行一次保留期清理、每日汇�
 
 ```sh
 cd /srv/cst-pilot-server
-docker compose --env-file telemetry.env down
+docker compose --env-file telemetry.env --env-file release.env down
 systemctl disable --now cst-telemetry-backup.timer cst-telemetry-tls.timer
 ```
 
