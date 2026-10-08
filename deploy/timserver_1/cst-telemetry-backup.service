@@ -1,0 +1,11 @@
+[Unit]
+Description=Tim telemetry SQLite backup
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /srv/cst-pilot-server/backup.py
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/cst-pilot-server/backups

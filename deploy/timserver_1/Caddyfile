@@ -1,0 +1,21 @@
+{
+	admin off
+	auto_https off
+}
+
+:8445 {
+	tls /certs/server.crt /certs/server.key
+	request_body {
+		max_size 1MB
+	}
+	handle /api/telemetry {
+		rewrite * /v1/sessions
+		reverse_proxy receiver:8787
+	}
+	handle /healthz {
+		reverse_proxy receiver:8787
+	}
+	handle {
+		respond "not found" 404
+	}
+}

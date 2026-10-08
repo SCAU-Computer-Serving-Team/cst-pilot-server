@@ -1,0 +1,12 @@
+[Unit]
+Description=Renew Tim telemetry TLS certificate
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /srv/cst-pilot-server/renew-tls.sh
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/cst-pilot-server/tls

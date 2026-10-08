@@ -29,12 +29,17 @@ CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测�
 
 ## 数据去向与保留
 
-- 只落在队伍自己的服务器，不经任何第三方。
+- 同时落在 CSTOA 服务器与 Tim 的 `timserver_1`，不经过第三方数据接收服务。
 - 会话记录长期保留；上传日志保留 90 天。
 
-## 待做
+## 部署
 
-- OAuth 内省接入：身份解析当前用桩（令牌格式 `stub-<mid>-<device>`）。OA 提供 `POST /api/oauth/introspect` 后，配置 `OA_INTROSPECT_URL` 与 `OA_SERVICE_TOKEN` 即切换为真内省，代码已就绪。
+| 接收端 | 地址 | 身份与运行 |
+|---|---|---|
+| CSTOA | `https://www.cstoa.top/api/telemetry` | systemd、nginx、真实 OA 内省 |
+| Tim | `https://8.163.28.9:8445/api/telemetry` | 独立 Docker Compose、专用 CA、真实 OA 内省，见[部署说明](deploy/timserver_1/README.md) |
+
+客户端同时向两端发送同一会话记录，两端分别存储、确认和去重。真实队员登录上传、异机备份及完整恢复演练待验收。
 
 ## 构建与运行
 
@@ -44,8 +49,8 @@ Go + 纯 Go SQLite 驱动（modernc.org/sqlite），单二进制 11MB，常驻�
 # Windows 交叉编译 Linux 产物
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o telemetry-receiver ./src
 
-# 常驻服务（默认 127.0.0.1:8787；身份解析用桩，令牌格式 stub-<mid>-<device>）
-TELEMETRY_PORT=8787 TELEMETRY_DB=/var/lib/cst-telemetry/telemetry.db ./telemetry-receiver serve
+# 常驻服务（生产须配置 OA 内省地址与服务凭据）
+TELEMETRY_PORT=8787 TELEMETRY_DB=/var/lib/cst-telemetry/telemetry.db OA_INTROSPECT_URL=https://www.cstoa.top/api/oauth/introspect OA_SERVICE_TOKEN=<服务凭据> ./telemetry-receiver serve
 
 # 其余子命令：export-csv [out] | rollup | delete --mid <id> | delete --device <id>
 ```

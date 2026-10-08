@@ -7,3 +7,7 @@ telemetry-receiver*
 *.db-shm
 *.csv
 .env
+deploy/**/telemetry.env
+deploy/**/tls/
+deploy/**/data/
+deploy/**/backups/
