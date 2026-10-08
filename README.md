@@ -40,6 +40,9 @@ CST Pilot 的服务端仓库：接收队员工具包上报的使用情况遥测�
 | Tim | `https://8.163.28.9:8445/api/telemetry` | 独立 Docker Compose、专用 CA、真实 OA 内省，见[部署说明](deploy/timserver_1/README.md) |
 
 客户端同时向两端发送同一会话记录，两端分别存储、确认和去重。真实队员登录上传、异机备份及完整恢复演练待验收。
+## 身份解析
+
+OA 已提供 `POST /api/oauth/introspect`。生产配置内省地址与服务凭据，接收端据此校验真实 Agent 令牌并取得学号、设备标识和失效原因。CSTOA 使用本机地址，Tim 使用 OA 的公开 HTTPS 地址。
 
 ## 构建与运行
 
