@@ -183,8 +183,9 @@ func exportCsv(args []string) error {
 func deleteCmd(args []string) error {
 	mid := flagValue(args, "--mid")
 	device := flagValue(args, "--device")
-	if mid == "" && device == "" {
-		return fmt.Errorf("delete requires --mid or --device")
+	installation := flagValue(args, "--installation")
+	if mid == "" && device == "" && installation == "" {
+		return fmt.Errorf("delete requires --mid, --device or --installation")
 	}
 	_, _, dbPath, _ := envOptions()
 	st, err := openStore(dbPath)
@@ -194,6 +195,8 @@ func deleteCmd(args []string) error {
 	var removed int64
 	if mid != "" {
 		removed, err = st.deleteByMid(mid)
+	} else if installation != "" {
+		removed, err = st.deleteWhere("installation_id = ?", installation)
 	} else {
 		removed, err = st.deleteByDevice(device)
 	}

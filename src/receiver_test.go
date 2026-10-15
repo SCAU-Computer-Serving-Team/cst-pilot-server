@@ -2,11 +2,20 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +29,174 @@ func testStore(t *testing.T) *store {
 	}
 	t.Cleanup(func() { st.close() })
 	return st
+}
+
+func signedUpload(t *testing.T, server *http.Server, private ed25519.PrivateKey, installation, body string, mutate ...func(*http.Request)) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/v1/sessions", strings.NewReader(body))
+	stamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	digest := sha256.Sum256([]byte(body))
+	message := strings.Join([]string{"telemetry-upload", installation, stamp, hex.EncodeToString(digest[:])}, "\n")
+	publicDER, err := x509.MarshalPKIXPublicKey(private.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Installation "+installation)
+	req.Header.Set("X-Telemetry-Key", base64.RawURLEncoding.EncodeToString(publicDER))
+	req.Header.Set("X-Telemetry-Time", stamp)
+	req.Header.Set("X-Telemetry-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, []byte(message))))
+	for _, change := range mutate {
+		change(req)
+	}
+	response := httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, req)
+	return response
+}
+
+func TestAnonymousUploadPersistsPortableEnvironment(t *testing.T) {
+	st := testStore(t)
+	server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installation := "df79039e-3744-44c8-9754-7a9568ae5684"
+	body := `{"v":"0.1","records":[{"v":"0.1","type":"session","recordId":"anonymous-env","mid":"spoof","deviceId":"spoof","identity":{"installationId":"` + installation + `","environmentId":"env-a","environmentSource":"windows-machine-guid"},"os":{"platform":"win32","name":"Windows 11 Pro","displayVersion":"24H2","version":"10.0.26100","arch":"arm64","isPE":false},"runtime":{"version":"24.15.0","arch":"x64"},"admin":null}]}`
+	for range 2 {
+		response := signedUpload(t, server, key, installation, body)
+		if response.Code != 202 {
+			t.Fatalf("anonymous upload = %d %s", response.Code, response.Body)
+		}
+	}
+	if count, _ := st.countSessions(); count != 1 {
+		t.Fatalf("dedup count = %d", count)
+	}
+	csv, err := st.exportSessionsCsv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{installation, "env-a", "Windows 11 Pro", "24H2", "24.15.0"} {
+		if !strings.Contains(csv, expected) {
+			t.Fatalf("CSV missing %s: %s", expected, csv)
+		}
+	}
+	if strings.Contains(csv, "spoof") {
+		t.Fatal("client identity trusted")
+	}
+}
+
+func TestInstallationCredentialBoundaries(t *testing.T) {
+	st := testStore(t)
+	server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	installation := "b1f77e2a-4efb-41fc-9ff4-e4a116b68959"
+	body := `{"records":[{"v":"0.1","type":"session","recordId":"signed-record"}]}`
+	for _, tc := range []struct {
+		name   string
+		change func(*http.Request)
+	}{
+		{"signature", func(r *http.Request) { r.Header.Set("X-Telemetry-Signature", "invalid") }},
+		{"clock", func(r *http.Request) { r.Header.Set("X-Telemetry-Time", "1") }},
+		{"body", func(r *http.Request) {
+			r.Body = io.NopCloser(strings.NewReader(strings.ReplaceAll(body, "signed-record", "changed")))
+		}},
+		{"public-key", func(r *http.Request) { r.Header.Set("X-Telemetry-Key", "invalid") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if response := signedUpload(t, server, key, installation, body, tc.change); response.Code != 401 {
+				t.Fatalf("tampered upload = %d %s", response.Code, response.Body)
+			}
+		})
+	}
+	var registrations int
+	if err := st.db.QueryRow("SELECT COUNT(*) FROM installations").Scan(&registrations); err != nil || registrations != 0 {
+		t.Fatalf("invalid signature registered key: %d %v", registrations, err)
+	}
+	if response := signedUpload(t, server, key, installation, body); response.Code != 202 {
+		t.Fatalf("valid signature = %d", response.Code)
+	}
+	// 重建服务实例模拟进程重启，公钥绑定来自数据库。
+	server = newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})
+	_, wrong, _ := ed25519.GenerateKey(rand.Reader)
+	if response := signedUpload(t, server, wrong, installation, body); response.Code != 403 {
+		t.Fatalf("changed key = %d", response.Code)
+	}
+	if response := signedUpload(t, server, key, installation, body); response.Code != 202 {
+		t.Fatalf("original key = %d", response.Code)
+	}
+	other := strings.ReplaceAll(body, `"recordId":"signed-record"`, `"recordId":"wrong-installation","identity":{"installationId":"other"}`)
+	response := signedUpload(t, server, key, installation, other)
+	if response.Code != 202 || !strings.Contains(response.Body.String(), `"installation-mismatch":1`) {
+		t.Fatalf("installation spoof accepted: %d %s", response.Code, response.Body)
+	}
+	if count, _ := st.countSessions(); count != 1 {
+		t.Fatalf("invalid uploads inserted: %d", count)
+	}
+}
+
+func TestAnonymousUploadRateLimit(t *testing.T) {
+	st := testStore(t)
+	server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})
+	for index := 0; index <= 60; index++ {
+		req := httptest.NewRequest("POST", "/v1/sessions", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Installation b1f77e2a-4efb-41fc-9ff4-e4a116b68959")
+		response := httptest.NewRecorder()
+		server.Handler.ServeHTTP(response, req)
+		if index < 60 && response.Code != 401 {
+			t.Fatalf("invalid signature returned %d", response.Code)
+		}
+		if index == 60 && response.Code != 429 {
+			t.Fatalf("rate limit returned %d", response.Code)
+		}
+	}
+}
+
+func TestExistingDatabaseMigrationAndAnonymousRollup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSchema := strings.Replace(schema, "\n\tinstallation_id TEXT NOT NULL DEFAULT '',\n\tenvironment_id TEXT NOT NULL DEFAULT '',", "", 1)
+	oldSchema = strings.Replace(oldSchema, "PRIMARY KEY (date, mid, installation_id, environment_id)", "PRIMARY KEY (date, mid)", 1)
+	if _, err = db.Exec(oldSchema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO sessions (record_id,mid,device_id,received_at,payload) VALUES ('legacy','member','device',?,'{"v":"0.1","type":"session","recordId":"legacy","os":{"arch":"x64"}}')`, utcNow(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"installation-a", "installation-b"} {
+		_, err := st.insertBatch([]insertRow{{recordID: id, receivedAt: utcNow(time.Now()), payload: map[string]any{"identity": map[string]any{"installationId": id, "environmentId": "environment"}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.refreshRollup(); err != nil {
+		t.Fatal(err)
+	}
+	var groups int
+	if err := st.db.QueryRow("SELECT COUNT(*) FROM daily_rollup").Scan(&groups); err != nil || groups != 3 {
+		t.Fatalf("anonymous origins merged: %d %v", groups, err)
+	}
+	st.close()
+	st, err = openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.close()
+	csv, err := st.exportSessionsCsv()
+	if err != nil || !strings.Contains(csv, "legacy,member,device,") {
+		t.Fatalf("legacy record lost: %s %v", csv, err)
+	}
+	var version, arch sql.NullString
+	if err := st.db.QueryRow("SELECT runtime_version, runtime_arch FROM sessions WHERE record_id='legacy'").Scan(&version, &arch); err != nil || version.Valid || arch.Valid {
+		t.Fatalf("unknown legacy runtime fabricated: %v %v %v", version, arch, err)
+	}
 }
 
 func TestIntrospectionRejectsServiceFailures(t *testing.T) {

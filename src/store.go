@@ -61,6 +61,10 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.migrateEnvironment(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -146,6 +150,8 @@ CREATE TABLE IF NOT EXISTS uploads (
 CREATE TABLE IF NOT EXISTS daily_rollup (
 	date TEXT NOT NULL,
 	mid TEXT NOT NULL,
+	installation_id TEXT NOT NULL DEFAULT '',
+	environment_id TEXT NOT NULL DEFAULT '',
 	sessions INTEGER NOT NULL DEFAULT 0,
 	duration_ms REAL NOT NULL DEFAULT 0,
 	active_ms REAL NOT NULL DEFAULT 0,
@@ -174,7 +180,7 @@ CREATE TABLE IF NOT EXISTS daily_rollup (
 	error_turns REAL NOT NULL DEFAULT 0,
 	models TEXT NOT NULL DEFAULT '[]',
 	tools TEXT NOT NULL DEFAULT '[]',
-	PRIMARY KEY (date, mid)
+	PRIMARY KEY (date, mid, installation_id, environment_id)
 );
 `
 
@@ -249,8 +255,8 @@ func (s *store) insertOne(tx *sql.Tx, row insertRow) (bool, error) {
 	for key, value := range row.payload {
 		p[key] = value
 	}
-	p["mid"] = row.mid
-	p["deviceId"] = row.deviceID
+	p["mid"] = nullableString(row.mid)
+	p["deviceId"] = nullableString(row.deviceID)
 	p["receivedAt"] = row.receivedAt
 	p["ip"] = row.ipNet
 	var costCny, costUsd, unpricedTurns float64
@@ -304,6 +310,19 @@ func (s *store) insertOne(tx *sql.Tx, row insertRow) (bool, error) {
 	if affected == 0 {
 		return false, nil
 	}
+	identity, _ := p["identity"].(map[string]any)
+	runtime, _ := p["runtime"].(map[string]any)
+	_, err = tx.Exec(`UPDATE sessions SET installation_id=?, environment_id=?, environment_source=?,
+		os_platform=?, os_name=?, os_display_version=?, os_is_pe=?, runtime_version=?, runtime_arch=? WHERE record_id=?`,
+		nullableString(identity["installationId"]), nullableString(identity["environmentId"]), nullableString(identity["environmentSource"]),
+		nullableString(osInfo["platform"]), nullableString(osInfo["name"]), nullableString(osInfo["displayVersion"]), nullableBool(osInfo["isPE"]),
+		nullableString(runtime["version"]), nullableString(runtime["arch"]), row.recordID)
+	if err != nil {
+		return false, err
+	}
+	if row.deviceID == "" {
+		return true, nil
+	}
 	return true, s.upsertDevice(tx, row, p, osInfo)
 }
 
@@ -344,6 +363,8 @@ func (s *store) logUpload(entry uploadLog) error {
 type rollupBucket struct {
 	date                string
 	mid                 string
+	installation        string
+	environment         string
 	sessions            int64
 	durationMs          float64
 	activeMs            float64
@@ -401,10 +422,13 @@ func (s *store) refreshRollup() error {
 		if err := jsonUnmarshal([]byte(payloadText), &payload); err != nil {
 			continue
 		}
-		key := day + "\x00" + mid
+		identity, _ := payload["identity"].(map[string]any)
+		installation, environment := str(identity["installationId"]), str(identity["environmentId"])
+		key := strings.Join([]string{day, mid, installation, environment}, "\x00")
 		bucket := buckets[key]
 		if bucket == nil {
 			bucket = newBucket(day, mid)
+			bucket.installation, bucket.environment = installation, environment
 			buckets[key] = bucket
 		}
 
@@ -480,8 +504,8 @@ func (s *store) refreshRollup() error {
 	stmt, err := tx.Prepare(`INSERT INTO daily_rollup (date, mid, sessions, duration_ms, active_ms, prompts, turns, context_entries,
 		compactions, compaction_overflows, compaction_failures, context_peak, context_window,
 		tool_calls, tool_failures, degraded, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-		cost_cny, cost_usd, unpriced_turns, aborted, network_errors, error_groups, error_turns, models, tools)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		cost_cny, cost_usd, unpriced_turns, aborted, network_errors, error_groups, error_turns, models, tools, installation_id, environment_id)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -492,7 +516,7 @@ func (s *store) refreshRollup() error {
 			bucket.peak, bucket.window, bucket.toolCalls, bucket.toolFailures, bucket.degraded, bucket.input, bucket.output,
 			bucket.cacheRead, bucket.cacheWrite, bucket.totalTokens, bucket.costCny, bucket.costUsd, bucket.unpricedTurns,
 			bucket.aborted, bucket.networkErrors, bucket.errorGroups, bucket.errorTurns,
-			distJSON(bucket.models, "turns"), distJSON(bucket.tools, "calls")); err != nil {
+			distJSON(bucket.models, "turns"), distJSON(bucket.tools, "calls"), bucket.installation, bucket.environment); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -597,6 +621,7 @@ var csvHeader = []string{
 	"started_at", "ended_at", "duration_ms", "active_ms", "prompts", "turns", "context_entries",
 	"compactions", "context_peak", "context_window", "network_errors", "aborted", "tool_failures",
 	"os_version", "os_arch", "admin", "cost_cny", "cost_usd", "unpriced_turns",
+	"installation_id", "environment_id", "environment_source", "os_platform", "os_name", "os_display_version", "os_is_pe", "runtime_version", "runtime_arch",
 }
 
 // exportSessionsCsv 报表导出：会话明细 CSV（聚合看板后置，先给原始明细）。

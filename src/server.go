@@ -9,12 +9,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
 type serverOptions struct {
-	store *store
-	auth  *introspector
+	store   *store
+	auth    *introspector
+	limiter *anonymousLimiter
 }
 
 // ipNetOf IPv4 记 /24 网段，其余原样。
@@ -51,6 +53,9 @@ func itoa(n int) string {
 }
 
 func newTelemetryServer(opts serverOptions) *http.Server {
+	if opts.limiter == nil {
+		opts.limiter = &anonymousLimiter{}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -110,23 +115,33 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		sendJSON(w, status, errorBody(code, message))
 	}
 
+	installation := ""
+	uploadIdentity := introspectResult{active: true}
 	if token == "" {
-		fail(401, "unauthorized", "missing bearer token")
-		return
+		installation = strings.TrimPrefix(r.Header.Get("Authorization"), "Installation ")
+		if !installationPattern.MatchString(installation) {
+			fail(401, "unauthorized", "missing upload credential")
+			return
+		}
+		if !opts.limiter.allow(ip, installation) {
+			sendJSON(w, 429, errorBody("rate_limited", "retry later"))
+			return
+		}
+	} else {
+		uploadIdentity = opts.auth.introspect(token)
 	}
-	identity := opts.auth.introspect(token)
-	if identity.err {
+	if uploadIdentity.err {
 		fail(503, "introspection_unavailable", "identity service down")
 		return
 	}
-	if !identity.active {
+	if !uploadIdentity.active {
 		code := "unauthorized"
 		status := 401
-		if identity.reason == "revoked" || identity.reason == "password-changed" {
+		if uploadIdentity.reason == "revoked" || uploadIdentity.reason == "password-changed" {
 			code = "forbidden"
 			status = 403
 		}
-		fail(status, code, identity.reason)
+		fail(status, code, uploadIdentity.reason)
 		return
 	}
 
@@ -139,6 +154,15 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		fail(413, "payload_too_large", "batch exceeds 1 MB")
 		return
 	}
+	var publicKey string
+	if installation != "" {
+		var verified bool
+		publicKey, verified = verifyInstallation(r, body, installation)
+		if !verified {
+			fail(401, "invalid_signature", "invalid installation signature")
+			return
+		}
+	}
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		fail(400, "invalid_json", "body is not valid JSON")
@@ -150,6 +174,18 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		return
 	}
 
+	if installation != "" {
+		registered, err := opts.store.registerInstallation(installation, publicKey)
+		if err != nil {
+			fail(503, "registration_unavailable", "installation registration failed")
+			return
+		}
+		if !registered {
+			fail(403, "installation_key_mismatch", "installation key already bound")
+			return
+		}
+	}
+
 	type acceptedRecord struct {
 		recordID string
 		payload  map[string]any
@@ -159,6 +195,12 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 	reasons := map[string]int{}
 	for index, record := range records {
 		reason := validateRecord(record)
+		if installation != "" {
+			claimed, _ := record["identity"].(map[string]any)
+			if id := str(claimed["installationId"]); id != "" && id != installation {
+				reason = "installation-mismatch"
+			}
+		}
 		if reason == "" {
 			accepted = append(accepted, acceptedRecord{recordID: str(record["recordId"]), payload: record})
 			continue
@@ -173,7 +215,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		rows := make([]insertRow, 0, len(accepted))
 		for _, entry := range accepted {
 			rows = append(rows, insertRow{
-				recordID: entry.recordID, mid: identity.identity.MID, deviceID: identity.identity.DeviceID,
+				recordID: entry.recordID, mid: uploadIdentity.identity.MID, deviceID: uploadIdentity.identity.DeviceID,
 				receivedAt: receivedAt, ipNet: ipNet, payload: entry.payload,
 			})
 		}
@@ -193,7 +235,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		rejectedDetail = []map[string]any{}
 	}
 	opts.store.logUpload(uploadLog{
-		batchID: batchID, receivedAt: receivedAt, mid: identity.identity.MID, deviceID: identity.identity.DeviceID,
+		batchID: batchID, receivedAt: receivedAt, mid: uploadIdentity.identity.MID, deviceID: uploadIdentity.identity.DeviceID,
 		recordCount: len(records), accepted: len(accepted), rejected: len(rejectedDetail), inserted: inserted,
 		rejectedDetail: rejectedDetail, statusCode: 202, bodyBytes: len(body),
 		durationMs: time.Since(startedAt).Milliseconds(), ipNet: ipNet,
