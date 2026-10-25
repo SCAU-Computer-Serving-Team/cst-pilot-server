@@ -65,6 +65,10 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.migrateBilling(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -259,19 +263,7 @@ func (s *store) insertOne(tx *sql.Tx, row insertRow) (bool, error) {
 	p["deviceId"] = nullableString(row.deviceID)
 	p["receivedAt"] = row.receivedAt
 	p["ip"] = row.ipNet
-	var costCny, costUsd, unpricedTurns float64
-	for _, model := range recordArray(p, "models") {
-		cost := num(model["cost"])
-		turns := num(model["turns"])
-		switch model["currency"] {
-		case "CNY":
-			costCny += cost
-		case "USD":
-			costUsd += cost
-		default:
-			unpricedTurns += turns
-		}
-	}
+	costCny, costUsd, unpricedTurns := modelCosts(p)
 	osInfo, _ := p["os"].(map[string]any)
 	if osInfo == nil {
 		osInfo = map[string]any{}
@@ -309,6 +301,10 @@ func (s *store) insertOne(tx *sql.Tx, row insertRow) (bool, error) {
 	}
 	if affected == 0 {
 		return false, nil
+	}
+	requests, settled, points := billingValues(p)
+	if _, err := tx.Exec(`UPDATE sessions SET cstoa_requests=?, cstoa_settled_requests=?, cstoa_quota_points=?, incomplete_usage_turns=? WHERE record_id=?`, requests, settled, points, incompleteUsage(p), row.recordID); err != nil {
+		return false, err
 	}
 	identity, _ := p["identity"].(map[string]any)
 	runtime, _ := p["runtime"].(map[string]any)
@@ -388,6 +384,10 @@ type rollupBucket struct {
 	costCny             float64
 	costUsd             float64
 	unpricedTurns       float64
+	billingRequests     sql.NullFloat64
+	billingSettled      sql.NullFloat64
+	billingPoints       sql.NullFloat64
+	incompleteUsage     sql.NullFloat64
 	aborted             float64
 	networkErrors       float64
 	errorGroups         float64
@@ -465,21 +465,22 @@ func (s *store) refreshRollup() error {
 			}
 			bucket.tools[name] += num(tool["calls"])
 		}
+		requests, settled, points := billingValues(payload)
+		addNullable(&bucket.billingRequests, requests)
+		addNullable(&bucket.billingSettled, settled)
+		addNullable(&bucket.billingPoints, points)
+		addNullable(&bucket.incompleteUsage, incompleteUsage(payload))
+		cny, usd, unpriced := modelCosts(payload)
+		bucket.costCny += cny
+		bucket.costUsd += usd
+		bucket.unpricedTurns += unpriced
 		for _, model := range recordArray(payload, "models") {
 			bucket.input += num(model["input"])
 			bucket.output += num(model["output"])
 			bucket.cacheRead += num(model["cacheRead"])
 			bucket.cacheWrite += num(model["cacheWrite"])
 			bucket.totalTokens += num(model["totalTokens"])
-			cost := num(model["cost"])
-			switch model["currency"] {
-			case "CNY":
-				bucket.costCny += cost
-			case "USD":
-				bucket.costUsd += cost
-			default:
-				bucket.unpricedTurns += num(model["turns"])
-			}
+
 			key := str(model["provider"]) + "/" + str(model["model"]) + "/" + str(model["thinkingLevel"])
 			bucket.models[key] += num(model["turns"])
 		}
@@ -504,8 +505,9 @@ func (s *store) refreshRollup() error {
 	stmt, err := tx.Prepare(`INSERT INTO daily_rollup (date, mid, sessions, duration_ms, active_ms, prompts, turns, context_entries,
 		compactions, compaction_overflows, compaction_failures, context_peak, context_window,
 		tool_calls, tool_failures, degraded, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens,
-		cost_cny, cost_usd, unpriced_turns, aborted, network_errors, error_groups, error_turns, models, tools, installation_id, environment_id)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		cost_cny, cost_usd, unpriced_turns, aborted, network_errors, error_groups, error_turns, models, tools, installation_id, environment_id,
+		cstoa_requests, cstoa_settled_requests, cstoa_quota_points, incomplete_usage_turns)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -516,7 +518,8 @@ func (s *store) refreshRollup() error {
 			bucket.peak, bucket.window, bucket.toolCalls, bucket.toolFailures, bucket.degraded, bucket.input, bucket.output,
 			bucket.cacheRead, bucket.cacheWrite, bucket.totalTokens, bucket.costCny, bucket.costUsd, bucket.unpricedTurns,
 			bucket.aborted, bucket.networkErrors, bucket.errorGroups, bucket.errorTurns,
-			distJSON(bucket.models, "turns"), distJSON(bucket.tools, "calls"), bucket.installation, bucket.environment); err != nil {
+			distJSON(bucket.models, "turns"), distJSON(bucket.tools, "calls"), bucket.installation, bucket.environment,
+			nullableNumber(bucket.billingRequests), nullableNumber(bucket.billingSettled), nullableNumber(bucket.billingPoints), nullableNumber(bucket.incompleteUsage)); err != nil {
 			tx.Rollback()
 			return err
 		}
@@ -621,6 +624,7 @@ var csvHeader = []string{
 	"started_at", "ended_at", "duration_ms", "active_ms", "prompts", "turns", "context_entries",
 	"compactions", "context_peak", "context_window", "network_errors", "aborted", "tool_failures",
 	"os_version", "os_arch", "admin", "cost_cny", "cost_usd", "unpriced_turns",
+	"cstoa_requests", "cstoa_settled_requests", "cstoa_quota_points", "incomplete_usage_turns",
 	"installation_id", "environment_id", "environment_source", "os_platform", "os_name", "os_display_version", "os_is_pe", "runtime_version", "runtime_arch",
 }
 

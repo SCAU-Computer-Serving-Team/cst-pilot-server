@@ -9,7 +9,8 @@ CST Pilot 的遥测接收端。客户端同时向 CSTOA 与 Tim 的 `timserver_1
 | 类别 | 内容 |
 |---|---|
 | 会话 | 起止、时长、提问与模型往返、TUI/Web、结束原因 |
-| 模型 | 供应商、模型、思考档位、token、估算费用与币种 |
+| 模型 | 供应商、模型、思考档位、token、估算费用与币种、usage 不完整轮次 |
+| CSTOA 扣点 | 独立额度点、观察请求数与已确认请求数；无确认时为未知 |
 | 工具 | 名称与子功能、调用、失败、降级、耗时和输出体积 |
 | 上下文与环境 | 压缩、峰值、系统名称与版本、系统与进程架构、PE、Node 版本和三态管理员权限 |
 | 匿名来源 | 工具包安装标识、独立于账户的系统环境摘要，不接收原始 MachineGuid |
@@ -33,6 +34,8 @@ CST Pilot 的遥测接收端。客户端同时向 CSTOA 与 Tim 的 `timserver_1
 
 新增字段保存至原始 payload 和派生列，CSV 包含系统名称、功能版本、安装与环境、Node 版本。每日汇总按日期、上传者、安装和环境分别聚合；新增字段缺失保持未知，重传不改变首次归属。
 
+会话与每日汇总新增 cstoa_requests、cstoa_settled_requests、cstoa_quota_points、incomplete_usage_turns 四个可空列，CSV 同步导出。只累加已知部分，全部未知保持 NULL；扣点须结合请求覆盖数量读取。首次迁移从 payload 重算费用派生值，CSTOA 计入未定价，原始 payload 保持不变。字段定义见主仓库[会话记录](https://github.com/SCAU-Computer-Serving-Team/cst-pilot/blob/main/doc/telemetry/schema.md)。
+
 本地测试身份须显式设置 `TELEMETRY_ALLOW_STUB=1`，生产不启用。
 
 ## 部署
@@ -44,7 +47,7 @@ CST Pilot 的遥测接收端。客户端同时向 CSTOA 与 Tim 的 `timserver_1
 
 两端均使用真实 OA 内省和每日在线 SQLite 备份。服务密钥与 TLS 私钥只在服务器保存，不进入仓库、镜像构建上下文或发行包。
 
-发布、版本核对与回退见[发布说明](doc/release.md)。异机备份、完整恢复和真实队员双端成功入库须独立验收。
+发布、版本核对与回退见[发布说明](doc/release.md)。异机备份、完整恢复和多队员上传须独立验收。
 
 ## 开发
 
