@@ -104,35 +104,25 @@ func (s *store) migrateBilling() error {
 	if !added {
 		return tx.Commit()
 	}
-	rows, err := tx.Query("SELECT record_id,payload FROM sessions")
-	if err != nil {
-		return err
-	}
-	type entry struct {
-		id string
-		p  map[string]any
-	}
-	var entries []entry
-	for rows.Next() {
+	// 按非空记录主键分页，每次仅解码一条；关闭读取后再更新，事务内保持有界内存。
+	lastID := ""
+	for {
 		var id, raw string
-		if err := rows.Scan(&id, &raw); err != nil {
-			rows.Close()
+		err := tx.QueryRow("SELECT record_id,payload FROM sessions WHERE record_id>? ORDER BY record_id LIMIT 1", lastID).Scan(&id, &raw)
+		if err == sql.ErrNoRows {
+			break
+		}
+		if err != nil {
 			return err
 		}
+		lastID = id
 		var p map[string]any
-		if jsonUnmarshal([]byte(raw), &p) == nil {
-			entries = append(entries, entry{id, p})
+		if jsonUnmarshal([]byte(raw), &p) != nil {
+			continue
 		}
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		r, n, q := billingValues(entry.p)
-		cny, usd, unpriced := modelCosts(entry.p)
-		if _, err := tx.Exec("UPDATE sessions SET cstoa_requests=?,cstoa_settled_requests=?,cstoa_quota_points=?,incomplete_usage_turns=?,cost_cny=?,cost_usd=?,unpriced_turns=? WHERE record_id=?", r, n, q, incompleteUsage(entry.p), cny, usd, unpriced, entry.id); err != nil {
+		r, n, q := billingValues(p)
+		cny, usd, unpriced := modelCosts(p)
+		if _, err := tx.Exec("UPDATE sessions SET cstoa_requests=?,cstoa_settled_requests=?,cstoa_quota_points=?,incomplete_usage_turns=?,cost_cny=?,cost_usd=?,unpriced_turns=? WHERE record_id=?", r, n, q, incompleteUsage(p), cny, usd, unpriced, id); err != nil {
 			return err
 		}
 	}

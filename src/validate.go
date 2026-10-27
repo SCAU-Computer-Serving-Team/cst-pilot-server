@@ -19,7 +19,7 @@ const (
 type envelope struct {
 	V         string           `json:"v"`
 	Records   []map[string]any `json:"records"`
-	Heartbeat map[string]any   `json:"heartbeat"`
+	Heartbeat any              `json:"heartbeat"`
 }
 
 // validateEnvelope 整批级校验；返回 records（nil 表示整批拒绝，code 带原因）。

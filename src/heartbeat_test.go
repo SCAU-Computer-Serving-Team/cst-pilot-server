@@ -90,6 +90,27 @@ func TestExpiredHeartbeatDoesNotRejectDurableStats(t *testing.T) {
 	}
 }
 
+func TestMalformedHeartbeatDoesNotRejectDurableStats(t *testing.T) {
+	st := testStore(t)
+	server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	owner := "df79039e-3744-44c8-9754-7a9568ae5684"
+	for i, heartbeat := range []string{`[]`, `"invalid"`, `42`, `null`, `{}`} {
+		body := fmt.Sprintf(`{"v":"0.2","records":[{"v":"0.2","type":"session","recordId":"malformed-heartbeat","revision":%d,"final":false,"identity":{"installationId":%q}}],"heartbeat":%s}`, i+1, owner, heartbeat)
+		response := signedUpload(t, server, key, owner, body)
+		var result struct {
+			Acks []snapshotAck `json:"acks"`
+			Ack  heartbeatAck  `json:"heartbeatAck"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || response.Code != 202 || len(result.Acks) != 1 || result.Acks[0].Status != "stored" || result.Ack.Reason != "invalid-heartbeat" {
+			t.Fatalf("malformed heartbeat %s rejected stats: %d %s", heartbeat, response.Code, response.Body)
+		}
+	}
+	if count, _ := st.countSessions(); count != 1 {
+		t.Fatalf("session count = %d", count)
+	}
+}
+
 func TestPureHeartbeatDoesNotCreateSession(t *testing.T) {
 	st := testStore(t)
 	server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})

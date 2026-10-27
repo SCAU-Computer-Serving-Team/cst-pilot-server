@@ -54,6 +54,39 @@ func TestSnapshotOwnershipFinalityAndFirstReceipt(t *testing.T) {
 	}
 }
 
+func TestUnknownSnapshotInstallationRemainsBoundToSigningOwner(t *testing.T) {
+	for _, identity := range []string{`{"installationId":null}`, `{"installationId":""}`, `{}`} {
+		t.Run(identity, func(t *testing.T) {
+			st := testStore(t)
+			server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(authOptions{})})
+			_, key, _ := ed25519.GenerateKey(rand.Reader)
+			owner := "df79039e-3744-44c8-9754-7a9568ae5684"
+			body := fmt.Sprintf(`{"v":"0.2","records":[{"v":"0.2","type":"session","recordId":"unknown-installation","revision":1,"final":false,"identity":%s}]}`, identity)
+			response := signedUpload(t, server, key, owner, body)
+			if response.Code != 202 || !strings.Contains(response.Body.String(), `"status":"stored"`) {
+				t.Fatalf("unknown identity rejected: %d %s", response.Code, response.Body)
+			}
+			var storedOwner, raw string
+			if err := st.db.QueryRow("SELECT owner_installation,payload FROM sessions WHERE record_id='unknown-installation'").Scan(&storedOwner, &raw); err != nil {
+				t.Fatal(err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+				t.Fatal(err)
+			}
+			encoded, _ := json.Marshal(payload["identity"])
+			if storedOwner != owner || string(encoded) != identity {
+				t.Fatalf("owner/unknown identity changed: %s %s", storedOwner, encoded)
+			}
+			body = strings.Replace(body, `"revision":1`, `"revision":2`, 1)
+			response = signedUpload(t, server, key, "b1f77e2a-4efb-41fc-9ff4-e4a116b68959", body)
+			if response.Code != 202 || !strings.Contains(response.Body.String(), `"reason":"owner-mismatch"`) {
+				t.Fatalf("signing ownership lost: %d %s", response.Code, response.Body)
+			}
+		})
+	}
+}
+
 func TestSnapshotCapabilitiesAndInstallationProof(t *testing.T) {
 	st := testStore(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

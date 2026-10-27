@@ -221,7 +221,7 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		}
 		if installation != "" {
 			claimed, _ := record["identity"].(map[string]any)
-			if id := str(claimed["installationId"]); (snapshots || id != "") && id != installation {
+			if id := str(claimed["installationId"]); id != "" && id != installation {
 				reason = "installation-mismatch"
 			}
 		}
