@@ -1,6 +1,7 @@
 // 遥测接收端 · HTTP 服务。
 //
-// 一个写端点 POST /v1/sessions，一个 GET /healthz；不开对外读接口。
+// POST /v1/sessions 写统计与心跳，GET 同路径声明能力，GET /healthz 检查健康。
+// 不开放记录读取或命令下发接口。
 // 单批上限：50 条或 1 MB，超出整批拒绝不截断（截断会让发送端把没送到的记录也删掉）。
 package main
 
@@ -17,6 +18,7 @@ type serverOptions struct {
 	store   *store
 	auth    *introspector
 	limiter *anonymousLimiter
+	now     func() time.Time
 }
 
 // ipNetOf IPv4 记 /24 网段，其余原样。
@@ -53,6 +55,9 @@ func itoa(n int) string {
 }
 
 func newTelemetryServer(opts serverOptions) *http.Server {
+	if opts.now == nil {
+		opts.now = time.Now
+	}
 	if opts.limiter == nil {
 		opts.limiter = &anonymousLimiter{}
 	}
@@ -70,6 +75,10 @@ func newTelemetryServer(opts serverOptions) *http.Server {
 		sendJSON(w, 200, map[string]any{"ok": true, "sessions": sessions, "version": buildVersion, "builtAt": buildTime})
 	})
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			sendJSON(w, 200, map[string]any{"protocols": []string{"0.1", "0.2"}, "capabilities": []string{"session-snapshots", "revision-acks", "heartbeat"}})
+			return
+		}
 		if r.Method != http.MethodPost {
 			sendJSON(w, 405, errorBody("method_not_allowed", "use POST"))
 			return
@@ -154,6 +163,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		fail(413, "payload_too_large", "batch exceeds 1 MB")
 		return
 	}
+	if token != "" {
+		installation = r.Header.Get("X-Telemetry-Installation")
+	}
 	var publicKey string
 	if installation != "" {
 		var verified bool
@@ -174,6 +186,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		return
 	}
 
+	snapshots := str(parsed["v"]) == "0.2"
+	if snapshots && installation == "" {
+		fail(401, "installation_required", "snapshot uploads require installation proof")
+		return
+	}
 	if installation != "" {
 		registered, err := opts.store.registerInstallation(installation, publicKey)
 		if err != nil {
@@ -191,13 +208,20 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 		payload  map[string]any
 	}
 	var accepted []acceptedRecord
+	acks := []snapshotAck{}
 	var rejectedDetail []map[string]any
 	reasons := map[string]int{}
 	for index, record := range records {
 		reason := validateRecord(record)
+		if snapshots && str(record["v"]) != "0.2" {
+			reason = "envelope-version-mismatch"
+		}
+		if !snapshots && str(record["v"]) == "0.2" {
+			reason = "envelope-version-mismatch"
+		}
 		if installation != "" {
 			claimed, _ := record["identity"].(map[string]any)
-			if id := str(claimed["installationId"]); id != "" && id != installation {
+			if id := str(claimed["installationId"]); (snapshots || id != "") && id != installation {
 				reason = "installation-mismatch"
 			}
 		}
@@ -205,11 +229,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 			accepted = append(accepted, acceptedRecord{recordID: str(record["recordId"]), payload: record})
 			continue
 		}
+		if snapshots {
+			acks = append(acks, snapshotAck{RecordID: str(record["recordId"]), Revision: num(record["revision"]), Status: "rejected", Reason: reason})
+		}
 		rejectedDetail = append(rejectedDetail, map[string]any{"index": index, "recordId": str(record["recordId"]), "reason": reason})
 		reasons[reason]++
 	}
 
-	receivedAt := utcNow(time.Now())
+	receivedAt := utcNow(opts.now())
 	var inserted int
 	if len(accepted) > 0 {
 		rows := make([]insertRow, 0, len(accepted))
@@ -219,7 +246,21 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 				receivedAt: receivedAt, ipNet: ipNet, payload: entry.payload,
 			})
 		}
-		n, err := opts.store.insertBatch(rows)
+		var n int
+		var err error
+		if snapshots {
+			var stored []snapshotAck
+			stored, n, err = opts.store.applySnapshots(rows, installation)
+			acks = append(acks, stored...)
+			for _, ack := range stored {
+				if ack.Status == "rejected" {
+					rejectedDetail = append(rejectedDetail, map[string]any{"recordId": ack.RecordID, "revision": ack.Revision, "reason": ack.Reason})
+					reasons[ack.Reason]++
+				}
+			}
+		} else {
+			n, err = opts.store.insertBatch(rows)
+		}
 		if err != nil {
 			fail(500, "server_error", err.Error())
 			return
@@ -236,11 +277,23 @@ func handleUpload(w http.ResponseWriter, r *http.Request, opts serverOptions) {
 	}
 	opts.store.logUpload(uploadLog{
 		batchID: batchID, receivedAt: receivedAt, mid: uploadIdentity.identity.MID, deviceID: uploadIdentity.identity.DeviceID,
-		recordCount: len(records), accepted: len(accepted), rejected: len(rejectedDetail), inserted: inserted,
+		recordCount: len(records), accepted: len(records) - len(rejectedDetail), rejected: len(rejectedDetail), inserted: inserted,
 		rejectedDetail: rejectedDetail, statusCode: 202, bodyBytes: len(body),
 		durationMs: time.Since(startedAt).Milliseconds(), ipNet: ipNet,
 	})
-	sendJSON(w, 202, map[string]any{"accepted": len(accepted), "rejected": len(rejectedDetail), "reasons": reasons})
+	result := map[string]any{"accepted": len(records) - len(rejectedDetail), "rejected": len(rejectedDetail), "reasons": reasons}
+	if snapshots {
+		result["v"], result["acks"] = "0.2", acks
+		if heartbeat, exists := parsed["heartbeat"]; exists {
+			ack, err := opts.store.applyHeartbeat(heartbeat, installation, opts.now())
+			if err != nil {
+				fail(500, "server_error", err.Error())
+				return
+			}
+			result["heartbeatAck"] = ack
+		}
+	}
+	sendJSON(w, 202, result)
 }
 
 func bearerToken(header string) string {

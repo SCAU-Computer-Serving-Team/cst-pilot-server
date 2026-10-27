@@ -4,7 +4,9 @@
 // 拒一条就是永久丢一条，条件取最保守的一组；其余一律宽容。
 package main
 
-var acceptedVersions = map[string]bool{"0.1": true}
+import "math"
+
+var acceptedVersions = map[string]bool{"0.1": true, "0.2": true}
 
 const (
 	envelopeMaxRecords = 50
@@ -15,7 +17,9 @@ const (
 )
 
 type envelope struct {
-	Records []map[string]any `json:"records"`
+	V         string           `json:"v"`
+	Records   []map[string]any `json:"records"`
+	Heartbeat map[string]any   `json:"heartbeat"`
 }
 
 // validateEnvelope 整批级校验；返回 records（nil 表示整批拒绝，code 带原因）。
@@ -24,7 +28,7 @@ func validateEnvelope(body []byte) (records []map[string]any, status int, code s
 	if err := jsonUnmarshal(body, &e); err != nil || e.Records == nil {
 		return nil, 400, "invalid_body"
 	}
-	if len(e.Records) == 0 {
+	if len(e.Records) == 0 && (e.V != "0.2" || e.Heartbeat == nil) {
 		return nil, 400, "empty_batch"
 	}
 	if len(e.Records) > envelopeMaxRecords {
@@ -45,6 +49,16 @@ func validateRecord(record map[string]any) string {
 	id, ok := record["recordId"].(string)
 	if !ok || id == "" || len(id) > 64 {
 		return "bad-record-id"
+	}
+	if v == "0.2" {
+		revision, ok := record["revision"].(float64)
+		if !ok || revision < 1 || revision > 9007199254740991 || math.Trunc(revision) != revision {
+			return "bad-revision"
+		}
+		final, ok := record["final"].(bool)
+		if !ok || final != (str(record["endReason"]) != "") {
+			return "bad-final-state"
+		}
 	}
 	if list, ok := record["tools"].([]any); ok && len(list) > maxTools {
 		return "too-many-elements"

@@ -69,6 +69,14 @@ func openStore(path string) (*store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.migratePresence(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := s.migrateSnapshots(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
 }
 
@@ -624,6 +632,7 @@ var csvHeader = []string{
 	"started_at", "ended_at", "duration_ms", "active_ms", "prompts", "turns", "context_entries",
 	"compactions", "context_peak", "context_window", "network_errors", "aborted", "tool_failures",
 	"os_version", "os_arch", "admin", "cost_cny", "cost_usd", "unpriced_turns",
+	"snapshot_revision", "snapshot_final", "updated_at",
 	"cstoa_requests", "cstoa_settled_requests", "cstoa_quota_points", "incomplete_usage_turns",
 	"installation_id", "environment_id", "environment_source", "os_platform", "os_name", "os_display_version", "os_is_pe", "runtime_version", "runtime_arch",
 }
