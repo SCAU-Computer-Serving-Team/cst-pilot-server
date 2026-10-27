@@ -79,17 +79,25 @@ func serve() error {
 		}
 	}
 	daily() // 启动先跑一轮。
+	if err := st.sweepRuns(time.Now()); err != nil {
+		return err
+	}
 	ticker := time.NewTicker(24 * time.Hour)
+	presenceTicker := time.NewTicker(15 * time.Second)
 	done := make(chan struct{})
 	var maintenance sync.WaitGroup
 	maintenance.Add(1)
-	defer func() { close(done); ticker.Stop(); maintenance.Wait() }()
+	defer func() { close(done); ticker.Stop(); presenceTicker.Stop(); maintenance.Wait() }()
 	go func() {
 		defer maintenance.Done()
 		for {
 			select {
 			case <-ticker.C:
 				daily()
+			case now := <-presenceTicker.C:
+				if err := st.sweepRuns(now); err != nil {
+					fmt.Fprintf(os.Stderr, "presence sweep failed: %v\n", err)
+				}
 			case <-done:
 				return
 			}

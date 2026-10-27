@@ -335,7 +335,7 @@ func TestHealthAndMethodBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		method, path string
 		status       int
-	}{{"GET", "/healthz", 200}, {"POST", "/healthz", 405}, {"GET", "/v1/sessions", 405}, {"GET", "/unknown", 404}} {
+	}{{"GET", "/healthz", 200}, {"POST", "/healthz", 405}, {"GET", "/v1/sessions", 200}, {"DELETE", "/v1/sessions", 405}, {"GET", "/unknown", 404}} {
 		res := httptest.NewRecorder()
 		server.Handler.ServeHTTP(res, httptest.NewRequest(tc.method, tc.path, nil))
 		if res.Code != tc.status {
