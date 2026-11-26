@@ -15,10 +15,12 @@ import (
 )
 
 type serverOptions struct {
-	store   *store
-	auth    *introspector
-	limiter *anonymousLimiter
-	now     func() time.Time
+	store        *store
+	auth         *introspector
+	limiter      *anonymousLimiter
+	releases     *releaseStore
+	releaseGuard *releaseGuard
+	now          func() time.Time
 }
 
 // ipNetOf IPv4 记 /24 网段，其余原样。
@@ -63,6 +65,7 @@ func newTelemetryServer(opts serverOptions) *http.Server {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		setRouteDeadlines(w, 30*time.Second, 30*time.Second)
 		if r.Method != http.MethodGet {
 			sendJSON(w, 405, errorBody("method_not_allowed", "use GET"))
 			return
@@ -72,9 +75,15 @@ func newTelemetryServer(opts serverOptions) *http.Server {
 			sendJSON(w, 500, errorBody("server_error", err.Error()))
 			return
 		}
-		sendJSON(w, 200, map[string]any{"ok": true, "sessions": sessions, "version": buildVersion, "builtAt": buildTime})
+		payload := map[string]any{"ok": true, "sessions": sessions, "version": buildVersion, "builtAt": buildTime}
+		if opts.releases != nil {
+			tripped := opts.releaseGuard != nil && opts.releaseGuard.isBudgetTripped()
+			payload["releases"] = opts.releases.healthSummary(tripped)
+		}
+		sendJSON(w, 200, payload)
 	})
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+		setRouteDeadlines(w, 30*time.Second, 30*time.Second)
 		if r.Method == http.MethodGet {
 			sendJSON(w, 200, map[string]any{"protocols": []string{"0.1", "0.2"}, "capabilities": []string{"session-snapshots", "revision-acks", "heartbeat"}})
 			return
@@ -85,11 +94,16 @@ func newTelemetryServer(opts serverOptions) *http.Server {
 		}
 		handleUpload(w, r, opts)
 	})
+	if opts.releases != nil {
+		guard := opts.releaseGuard
+		if guard == nil {
+			guard = newReleaseGuard(opts.releases.cfg, opts.now)
+		}
+		registerReleaseRoutes(mux, opts.releases, guard)
+	}
 	return &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 }

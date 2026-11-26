@@ -1,0 +1,87 @@
+# CSTOA 客户端发行包分发 Nginx 配置模板
+#
+# 使用方式：
+# 1. 将 limit_conn_zone 与 limit_req_zone 放入 http {} 块。
+# 2. 将 location 块放入 https://www.cstoa.top 对应的 server {} 块。
+# 3. 确认宿主机 /var/lib/cst-releases 目录归属 csttele:csttele 且权限为 0755。
+# 4. 执行 nginx -t 校验通过后再 reload nginx。
+
+# --- http {} 块 ---
+limit_conn_zone $binary_remote_addr zone=cst_rel_ip_conn:10m;
+limit_conn_zone $server_name        zone=cst_rel_total_conn:1m;
+limit_req_zone  $binary_remote_addr zone=cst_rel_manifest_req:10m rate=30r/m;
+limit_req_zone  $binary_remote_addr zone=cst_rel_file_req:10m     rate=12r/m;
+limit_req_zone  $binary_remote_addr zone=cst_rel_admin_req:5m     rate=6r/m;
+
+# --- https://www.cstoa.top 的 server {} 块 ---
+
+# 1. 正式通道签名清单（客户端编译期 CST_UPDATE_MANIFEST_URL）
+location = /api/agent/releases/latest {
+    limit_req zone=cst_rel_manifest_req burst=20 nodelay;
+    limit_req_status 429;
+    proxy_pass http://127.0.0.1:8787/v1/releases/channels/stable/latest;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+}
+
+# 2. 内测通道签名清单（未激活版本时返回 404 channel_empty）
+location = /api/agent/releases/beta {
+    limit_req zone=cst_rel_manifest_req burst=20 nodelay;
+    limit_req_status 429;
+    proxy_pass http://127.0.0.1:8787/v1/releases/channels/beta/latest;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+}
+
+# 3. 归档下载入口（Go 验参限流记账后通过 X-Accel-Redirect 转交 Nginx 零拷贝直出）
+location ^~ /api/agent/releases/files/ {
+    limit_conn cst_rel_ip_conn 4;
+    limit_conn cst_rel_total_conn 20;
+    limit_conn_status 429;
+    limit_req zone=cst_rel_file_req burst=6 nodelay;
+    limit_req_status 429;
+
+    proxy_pass http://127.0.0.1:8787/v1/releases/files/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_connect_timeout 5s;
+    proxy_read_timeout 15s;
+}
+
+# 4. 内部只读零拷贝目录（公网直访固定返回 404）
+location ^~ /_internal/cst-releases/ {
+    internal;
+    alias /var/lib/cst-releases/;
+    sendfile on;
+    sendfile_max_chunk 1m;
+    tcp_nopush on;
+    tcp_nodelay on;
+    gzip off;
+    # 常规安装包 43 到 60 MiB 全程满速跑完，仅对超出 65 MiB 的异常连接降速
+    limit_rate_after 65m;
+    limit_rate 2m;
+    send_timeout 60s;
+}
+
+# 5. 可选公网管理入口（默认通过 SSH 本地转发访问 127.0.0.1:8787，不开放公网）
+# location ^~ /api/agent/releases/admin/ {
+#     limit_req zone=cst_rel_admin_req burst=5 nodelay;
+#     limit_req_status 429;
+#     client_max_body_size 260m;
+#     proxy_request_buffering off;
+#     proxy_buffering off;
+#     proxy_pass http://127.0.0.1:8787/v1/admin/releases/;
+#     proxy_http_version 1.1;
+#     proxy_set_header Host $host;
+#     proxy_set_header X-Real-IP $remote_addr;
+#     proxy_connect_timeout 10s;
+#     proxy_send_timeout 600s;
+#     proxy_read_timeout 600s;
+# }

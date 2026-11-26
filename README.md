@@ -1,6 +1,6 @@
 # CST Pilot Server
 
-CST Pilot 的遥测接收端。客户端同时向 CSTOA 与 Tim 的 `timserver_1` 上传会话统计，两端独立存储、确认和去重。程序使用 Go 与纯 Go SQLite 驱动，编译为单个可执行文件。
+CST Pilot 的遥测接收与客户端发行包分发服务端。客户端向 CSTOA 与 Tim 的 `timserver_1` 上传会话统计，两端独立存储、确认和去重。CSTOA 实例同时支持托管与分发客户端便携 ZIP 安装包。程序使用 Go 与纯 Go SQLite 驱动，编译为单个可执行文件。
 
 ## 收集与保留
 
@@ -28,7 +28,12 @@ CST Pilot 的遥测接收端。客户端同时向 CSTOA 与 Tim 的 `timserver_1
 |---|---|
 | `POST /v1/sessions` | 上传会话统计及心跳；支持 `0.1` 最终记录和 `0.2` 累计快照与逐版本确认 |
 | `GET /v1/sessions` | 声明协议与能力，不返回记录 |
-| `GET /healthz` | 健康、会话条数、提交版本与构建时间 |
+| `GET /healthz` | 健康、会话条数、提交版本、构建时间，启用发行模块时附带发行摘要 |
+| `GET /v1/releases/channels/{channel}/latest` | 返回 `stable` 或 `beta` 通道当前签名清单（仅在配置 `RELEASE_STORAGE_DIR` 时启用） |
+| `GET /v1/releases/files/{version}/{filename}` | 分发已验签不可变归档（支持 Nginx `X-Accel-Redirect` 与 Go 直出双模式） |
+| `/v1/admin/releases` | 管理查询、流式上传入库、切版回滚、删除与配额回收（需管理令牌与双重 Ed25519 验签） |
+
+客户端发行包托管与分发的完整架构、源 URL、连接状态机、报错映射与 Nginx 配置见[发行包分发设计](doc/release-distribution.md)。未配置 `RELEASE_STORAGE_DIR` 时发行模块保持关闭，不影响纯遥测实例。
 
 生产须配置 `OA_INTROSPECT_URL` 与 `OA_SERVICE_TOKEN`。内省使用 HTTPS，或本机回环 HTTP；不跟随重定向。服务故障返回 503 且不缓存故障，令牌无效返回 401/403。身份字段在数据库列和原始 `payload` 中均来自验证结果。
 
@@ -70,4 +75,4 @@ python -m unittest discover -s scripts -p 'test_*.py' -v
 | `deploy/` | 两个服务器的程序配置、定时任务和运维说明 |
 | `doc/` | 发布与验证规则 |
 
-命令：`serve`、`version`、`export-csv [out]`、`rollup`、`delete --mid <学号>`、`delete --device <登录标识>`、`delete --installation <安装ID>`。导出与删除需要显式设置 `TELEMETRY_DB`，删除只用于经过确认的运维操作。
+命令：`serve`、`version`、`export-csv [out]`、`rollup`、`delete --mid <学号>`、`delete --device <登录标识>`、`delete --installation <安装ID>`、`release <list|publish|activate|gc>`。导出与删除需要显式设置 `TELEMETRY_DB`，删除只用于经过确认的运维操作。
