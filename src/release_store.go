@@ -1,9 +1,10 @@
-// 发行包分发 · 原子存储、崩溃自愈、历史版本配额回收与审计日志。
+// 发行包分发 · 原子存储、生命周期级独占锁、崩溃自愈、历史版本配额回收与审计日志。
 //
 // 发行包目录与遥测 SQLite 物理隔离，热路径通过不可变内存快照无锁响应。
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +39,7 @@ var (
 	errInsufficientStorage = errors.New("insufficient_storage")
 	errArchiveTooLarge     = errors.New("archive_too_large")
 	errVerifyFailed        = errors.New("verification_failed")
+	errStoreOwnerLocked    = errors.New("storage_locked_by_another_process")
 )
 
 type releaseError struct {
@@ -51,17 +54,25 @@ func wrapReleaseErr(kind error, format string, args ...any) error {
 	return &releaseError{kind: kind, msg: fmt.Sprintf(format, args...)}
 }
 
+type releaseHistoryEntry struct {
+	ArchiveSHA256    string `json:"archiveSha256"`
+	ManifestSHA256   string `json:"manifestSha256"`
+	FirstPublishedAt string `json:"firstPublishedAt"`
+}
+
 type releaseState struct {
-	SchemaVersion  int                       `json:"schemaVersion"`
-	Channels       map[string]string         `json:"channels"`
-	PreviousStable string                    `json:"previousStable,omitempty"`
-	Versions       map[string]*releaseRecord `json:"versions"`
+	SchemaVersion  int                            `json:"schemaVersion"`
+	Channels       map[string]string              `json:"channels"`
+	PreviousStable string                         `json:"previousStable,omitempty"`
+	Versions       map[string]*releaseRecord      `json:"versions"`
+	History        map[string]releaseHistoryEntry `json:"history,omitempty"`
 }
 
 type releaseRecord struct {
 	Version              string `json:"version"`
 	Filename             string `json:"filename"`
 	ArchiveSize          int64  `json:"archiveSize"`
+	ManifestSize         int64  `json:"manifestSize"`
 	UnpackedSize         uint64 `json:"unpackedSize"`
 	ArchiveSHA256        string `json:"archiveSha256"`
 	ManifestSHA256       string `json:"manifestSha256"`
@@ -127,10 +138,18 @@ type releaseStore struct {
 	now       func() time.Time
 	freeBytes func(string) (uint64, error)
 
+	// 生命周期级文件锁，确保同一存储目录同时只有一个所有者进程。
+	ownerLockFile *os.File
+	ownerLockMu   sync.Mutex
+
 	writeBusy atomic.Bool
 	stateMu   sync.Mutex
 	state     *releaseState
 	snapshot  atomic.Pointer[releaseSnapshot]
+
+	// 测试故障注入钩子（正常为 nil）。
+	beforeStateRename func() error
+	afterStateRename  func() error
 }
 
 func openReleaseStore(cfg releaseConfig) (*releaseStore, error) {
@@ -156,9 +175,22 @@ func openReleaseStoreWithHooks(cfg releaseConfig, nowFn func() time.Time, freeFn
 		freeBytes: freeFn,
 	}
 	if err := rs.initAndRecover(); err != nil {
+		_ = rs.close()
 		return nil, err
 	}
 	return rs, nil
+}
+
+func (s *releaseStore) close() error {
+	s.ownerLockMu.Lock()
+	defer s.ownerLockMu.Unlock()
+	if s.ownerLockFile == nil {
+		return nil
+	}
+	_ = unlockFile(s.ownerLockFile)
+	err := s.ownerLockFile.Close()
+	s.ownerLockFile = nil
+	return err
 }
 
 func (s *releaseStore) tmpDir() string { return filepath.Join(s.cfg.StorageDir, releaseTmpDirName) }
@@ -178,6 +210,14 @@ func (s *releaseStore) versionDir(version string) string {
 }
 
 func ensureNonSymlinkDir(path string, perm os.FileMode) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return fmt.Errorf("path %s must be a real directory", path)
+		}
+		return os.Chmod(path, perm)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	if err := os.MkdirAll(path, perm); err != nil {
 		return err
 	}
@@ -191,31 +231,49 @@ func ensureNonSymlinkDir(path string, perm os.FileMode) error {
 	return os.Chmod(path, perm)
 }
 
-func (s *releaseStore) acquireExclusiveLock() (func(), error) {
-	if !s.writeBusy.CompareAndSwap(false, true) {
-		return nil, wrapReleaseErr(errReleaseBusy, "another release mutation is in progress")
+func rejectIfSymlink(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("symlink rejected at %s", path)
+	}
+	return nil
+}
+
+func (s *releaseStore) acquireOwnerLock() error {
+	if err := rejectIfSymlink(s.lockPath()); err != nil {
+		return err
 	}
 	f, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		s.writeBusy.Store(false)
-		return nil, err
+		return err
 	}
 	locked, err := tryLockFile(f)
 	if err != nil {
-		f.Close()
-		s.writeBusy.Store(false)
-		return nil, err
+		_ = f.Close()
+		return err
 	}
 	if !locked {
-		f.Close()
-		s.writeBusy.Store(false)
-		return nil, wrapReleaseErr(errReleaseBusy, "another process holds the release lock")
-	}
-	return func() {
-		_ = unlockFile(f)
 		_ = f.Close()
-		s.writeBusy.Store(false)
-	}, nil
+		return wrapReleaseErr(errStoreOwnerLocked, "release storage %s is held by another running process; stop it or omit --offline", s.cfg.StorageDir)
+	}
+	s.ownerLockMu.Lock()
+	s.ownerLockFile = f
+	s.ownerLockMu.Unlock()
+	return nil
+}
+
+// tryAcquireWriteSlot 获取进程内独占写槽，确保并发上传/切版/删除/GC 串行且提前拒绝。
+func (s *releaseStore) tryAcquireWriteSlot() (func(), error) {
+	if !s.writeBusy.CompareAndSwap(false, true) {
+		return nil, wrapReleaseErr(errReleaseBusy, "another release mutation is in progress")
+	}
+	return func() { s.writeBusy.Store(false) }, nil
 }
 
 func (s *releaseStore) initAndRecover() error {
@@ -228,24 +286,19 @@ func (s *releaseStore) initAndRecover() error {
 	if err := ensureNonSymlinkDir(s.versionsDir(), 0o755); err != nil {
 		return fmt.Errorf("init release versions dir: %w", err)
 	}
-
-	unlock, err := s.acquireExclusiveLock()
-	if err != nil {
-		return fmt.Errorf("lock release storage on startup: %w", err)
+	if err := s.acquireOwnerLock(); err != nil {
+		return err
 	}
-	defer unlock()
 
-	// 清理残留未完成上传与临时状态文件。
 	if err := cleanDirContentsNoSymlink(s.tmpDir()); err != nil {
 		return fmt.Errorf("cleanup release tmp dir: %w", err)
 	}
 
-	state, err := s.loadStateFile()
+	state, existed, err := s.loadStateFile()
 	if err != nil {
 		return err
 	}
 
-	// 扫描 versions/ 目录，移除未登记在 state.json 中的孤儿目录，并拒绝符号链接。
 	entries, err := os.ReadDir(s.versionsDir())
 	if err != nil {
 		return fmt.Errorf("scan release versions dir: %w", err)
@@ -267,18 +320,20 @@ func (s *releaseStore) initAndRecover() error {
 		}
 	}
 
-	// 核验所有已登记版本，激活版本受损时直接阻断启动。
 	activeVersions := map[string]bool{}
 	for _, ch := range []string{"stable", "beta"} {
 		if v := state.Channels[ch]; v != "" {
 			activeVersions[v] = true
 		}
 	}
+	verifiedManifests := make(map[string][]byte, len(state.Versions))
+	stateChanged := !existed
 	for ver, rec := range state.Versions {
 		if !isValidReleaseVersionString(ver) || rec == nil || rec.Version != ver {
 			return fmt.Errorf("corrupt state entry for version %q", ver)
 		}
-		if _, err := s.verifyStoredVersionOnDisk(rec); err != nil {
+		envBytes, manifestHash, err := s.verifyStoredVersionOnDisk(rec)
+		if err != nil {
 			if activeVersions[ver] {
 				return fmt.Errorf("active release %s verification failed: %w", ver, err)
 			}
@@ -288,7 +343,23 @@ func (s *releaseStore) initAndRecover() error {
 				state.PreviousStable = ""
 			}
 			_ = safeRemoveAllNoSymlink(s.versionDir(ver))
+			stateChanged = true
+			continue
 		}
+		if rec.ManifestSize == 0 || rec.ManifestSHA256 != manifestHash {
+			rec.ManifestSize = int64(len(envBytes))
+			rec.ManifestSHA256 = manifestHash
+			stateChanged = true
+		}
+		if _, ok := state.History[ver]; !ok {
+			state.History[ver] = releaseHistoryEntry{
+				ArchiveSHA256:    rec.ArchiveSHA256,
+				ManifestSHA256:   rec.ManifestSHA256,
+				FirstPublishedAt: rec.PublishedAt,
+			}
+			stateChanged = true
+		}
+		verifiedManifests[ver] = envBytes
 	}
 	for _, ch := range []string{"stable", "beta"} {
 		if v := state.Channels[ch]; v != "" {
@@ -298,12 +369,14 @@ func (s *releaseStore) initAndRecover() error {
 		}
 	}
 
-	snap, err := s.buildSnapshotLocked(state)
+	snap, err := s.buildSnapshotFromVerified(state, verifiedManifests)
 	if err != nil {
 		return err
 	}
-	if err := s.saveStateLocked(state); err != nil {
-		return err
+	if stateChanged {
+		if err := s.saveStateAtomic(state); err != nil {
+			return err
+		}
 	}
 	s.stateMu.Lock()
 	s.state = state
@@ -312,21 +385,25 @@ func (s *releaseStore) initAndRecover() error {
 	return nil
 }
 
-func (s *releaseStore) loadStateFile() (*releaseState, error) {
+func (s *releaseStore) loadStateFile() (*releaseState, bool, error) {
+	if err := rejectIfSymlink(s.statePath()); err != nil {
+		return nil, false, err
+	}
 	raw, err := os.ReadFile(s.statePath())
 	if errors.Is(err, os.ErrNotExist) {
 		return &releaseState{
 			SchemaVersion: 1,
 			Channels:      map[string]string{"stable": "", "beta": ""},
 			Versions:      map[string]*releaseRecord{},
-		}, nil
+			History:       map[string]releaseHistoryEntry{},
+		}, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read release state: %w", err)
+		return nil, false, fmt.Errorf("read release state: %w", err)
 	}
 	var st releaseState
 	if err := json.Unmarshal(raw, &st); err != nil {
-		return nil, fmt.Errorf("parse release state: %w", err)
+		return nil, false, fmt.Errorf("parse release state: %w", err)
 	}
 	if st.SchemaVersion == 0 {
 		st.SchemaVersion = 1
@@ -343,75 +420,102 @@ func (s *releaseStore) loadStateFile() (*releaseState, error) {
 	if st.Versions == nil {
 		st.Versions = map[string]*releaseRecord{}
 	}
-	return &st, nil
+	if st.History == nil {
+		st.History = map[string]releaseHistoryEntry{}
+	}
+	return &st, true, nil
 }
 
-func (s *releaseStore) saveStateLocked(st *releaseState) error {
+// saveStateAtomic 原子替换 state.json；返回 (renamed, err)。
+// 一旦 renamed == true，磁盘状态已提交为 st，调用方必须同步内存状态不可回退。
+func (s *releaseStore) saveStateAtomicWithFlag(st *releaseState) (bool, error) {
+	if err := rejectIfSymlink(s.statePath()); err != nil {
+		return false, err
+	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		return err
+		return false, err
 	}
 	data = append(data, '\n')
 	tmpName := filepath.Join(s.tmpDir(), "state-"+randomHex(8)+".json")
 	f, err := os.OpenFile(tmpName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		_ = os.Remove(tmpName)
-		return err
+		return false, err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		_ = os.Remove(tmpName)
-		return err
+		return false, err
 	}
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return false, err
+	}
+	if s.beforeStateRename != nil {
+		if err := s.beforeStateRename(); err != nil {
+			_ = os.Remove(tmpName)
+			return false, err
+		}
 	}
 	if err := os.Rename(tmpName, s.statePath()); err != nil {
 		_ = os.Remove(tmpName)
-		return err
+		return false, err
 	}
-	return syncDir(s.cfg.StorageDir)
+	if s.afterStateRename != nil {
+		if err := s.afterStateRename(); err != nil {
+			return true, err
+		}
+	}
+	if err := syncDir(s.cfg.StorageDir); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
-func (s *releaseStore) verifyStoredVersionOnDisk(rec *releaseRecord) ([]byte, error) {
+func (s *releaseStore) saveStateAtomic(st *releaseState) error {
+	_, err := s.saveStateAtomicWithFlag(st)
+	return err
+}
+
+func (s *releaseStore) verifyStoredVersionOnDisk(rec *releaseRecord) ([]byte, string, error) {
 	vDir := s.versionDir(rec.Version)
 	info, err := os.Lstat(vDir)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("version directory invalid")
+		return nil, "", fmt.Errorf("version directory invalid")
 	}
 	manifestPath := filepath.Join(vDir, "manifest.json")
 	mInfo, err := os.Lstat(manifestPath)
 	if err != nil || !mInfo.Mode().IsRegular() || mInfo.Size() > maxManifestBytes {
-		return nil, fmt.Errorf("manifest file invalid")
+		return nil, "", fmt.Errorf("manifest file invalid")
 	}
 	envBytes, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	verified, err := verifyReleaseManifestEnvelope(envBytes, s.cfg.PublicKey, s.cfg.PublicBaseURL, s.cfg.MaxArchiveBytes)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if verified.Info.Version != rec.Version || verified.Filename != rec.Filename {
-		return nil, fmt.Errorf("manifest version or filename mismatch")
+		return nil, "", fmt.Errorf("manifest version or filename mismatch")
 	}
 	archivePath := filepath.Join(vDir, rec.Filename)
 	aInfo, err := os.Lstat(archivePath)
 	if err != nil || !aInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("archive file missing or irregular")
+		return nil, "", fmt.Errorf("archive file missing or irregular")
 	}
 	if aInfo.Size() != rec.ArchiveSize || uint64(aInfo.Size()) != verified.Info.Archive.Size {
-		return nil, fmt.Errorf("archive file size mismatch on disk")
+		return nil, "", fmt.Errorf("archive file size mismatch on disk")
 	}
-	return envBytes, nil
+	return verified.Envelope, verified.ManifestSHA256, nil
 }
 
-func (s *releaseStore) buildSnapshotLocked(st *releaseState) (*releaseSnapshot, error) {
+func (s *releaseStore) buildSnapshotFromVerified(st *releaseState, verifiedManifests map[string][]byte) (*releaseSnapshot, error) {
 	snap := &releaseSnapshot{
 		channels:       make(map[string]*channelSnapshot, 2),
 		files:          make(map[string]*fileSnapshot, len(st.Versions)),
@@ -421,7 +525,7 @@ func (s *releaseStore) buildSnapshotLocked(st *releaseState) (*releaseSnapshot, 
 	for ver, rec := range st.Versions {
 		recCopy := *rec
 		snap.records = append(snap.records, &recCopy)
-		snap.totalBytes += rec.ArchiveSize
+		snap.totalBytes += rec.ArchiveSize + rec.ManifestSize
 		snap.files[ver] = &fileSnapshot{
 			Version:       rec.Version,
 			Filename:      rec.Filename,
@@ -446,14 +550,23 @@ func (s *releaseStore) buildSnapshotLocked(st *releaseState) (*releaseSnapshot, 
 		if rec == nil {
 			continue
 		}
-		envBytes, err := os.ReadFile(filepath.Join(s.versionDir(ver), "manifest.json"))
-		if err != nil {
-			return nil, fmt.Errorf("load active manifest %s/%s: %w", ch, ver, err)
+		var envBytes []byte
+		var manifestHash string
+		if cached, ok := verifiedManifests[ver]; ok {
+			envBytes = cached
+			sum := sha256.Sum256(envBytes)
+			manifestHash = hex.EncodeToString(sum[:])
+		} else {
+			var err error
+			envBytes, manifestHash, err = s.verifyStoredVersionOnDisk(rec)
+			if err != nil {
+				return nil, fmt.Errorf("verify active manifest %s/%s: %w", ch, ver, err)
+			}
 		}
 		snap.channels[ch] = &channelSnapshot{
 			Version:        ver,
 			ManifestBytes:  envBytes,
-			ManifestSHA256: rec.ManifestSHA256,
+			ManifestSHA256: manifestHash,
 			PublishedAt:    rec.PublishedAt,
 		}
 	}
@@ -543,26 +656,46 @@ func (s *releaseStore) inventorySnapshot() map[string]any {
 	}
 }
 
-// publishStreaming 执行完整原子发布状态机：
-// 拿锁 -> 验签 manifest -> 查重 -> 磁盘水位预检 -> 通过 nextArchive 获取流并落盘算哈希 -> 流式 ZIP 全树核验 -> 原子移入并更新 state/快照 -> GC。
+// publishStreaming 获取独占写槽并执行原子发布。
 func (s *releaseStore) publishStreaming(
+	ctx context.Context,
 	channel string,
 	activate bool,
 	manifestBytes []byte,
 	nextArchive func() (io.Reader, error),
+	afterArchive func() error,
 	actor string,
 ) (*publishResult, error) {
-	if !isValidReleaseChannel(channel) {
-		return nil, wrapReleaseErr(errInvalidChannel, "channel must be stable or beta")
-	}
-	unlock, err := s.acquireExclusiveLock()
+	releaseSlot, err := s.tryAcquireWriteSlot()
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer releaseSlot()
+	return s.publishStreamingLocked(ctx, channel, activate, manifestBytes, nextArchive, afterArchive, actor)
+}
+
+// publishStreamingLocked 供已经提前持有独占写槽的调用方（如 HTTP 上传入口）使用。
+func (s *releaseStore) publishStreamingLocked(
+	ctx context.Context,
+	channel string,
+	activate bool,
+	manifestBytes []byte,
+	nextArchive func() (io.Reader, error),
+	afterArchive func() error,
+	actor string,
+) (*publishResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !isValidReleaseChannel(channel) {
+		return nil, wrapReleaseErr(errInvalidChannel, "channel must be stable or beta")
+	}
 
 	verified, err := verifyReleaseManifestEnvelope(manifestBytes, s.cfg.PublicKey, s.cfg.PublicBaseURL, s.cfg.MaxArchiveBytes)
 	if err != nil {
+		if errors.Is(err, errArchiveTooLarge) {
+			return nil, err
+		}
 		return nil, wrapReleaseErr(errVerifyFailed, "%v", err)
 	}
 	ver := verified.Info.Version
@@ -571,14 +704,18 @@ func (s *releaseStore) publishStreaming(
 	curState := cloneReleaseState(s.state)
 	s.stateMu.Unlock()
 
+	// 永久禁止复用已发布过（含已 GC/已删除）的版本号，保护 immutable 归档缓存一致。
 	if _, exists := curState.Versions[ver]; exists {
 		return nil, wrapReleaseErr(errVersionExists, "version %s already exists and is immutable", ver)
+	}
+	if _, seenBefore := curState.History[ver]; seenBefore {
+		return nil, wrapReleaseErr(errVersionExists, "version %s was previously published and cannot be reused", ver)
 	}
 	if _, err := os.Lstat(s.versionDir(ver)); err == nil {
 		return nil, wrapReleaseErr(errVersionExists, "version directory %s already exists", ver)
 	}
 
-	// 磁盘空间水位预检（在接收大包前拦截）。
+	// 磁盘空间水位预检（在接收压缩包前拦截）。
 	requiredFree := requiredDiskBytesForArchive(verified.Info.Archive.Size, s.cfg.MinFreeBytes)
 	freeNow, err := s.freeBytes(s.cfg.StorageDir)
 	if err != nil {
@@ -607,52 +744,60 @@ func (s *releaseStore) publishStreaming(
 	archiveStagePath := filepath.Join(stageDir, verified.Filename)
 	archiveFile, err := os.OpenFile(archiveStagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("create temp archive file: %w", err)
+		return nil, mapStorageIOError("create temp archive file", err)
 	}
 
-	// 流式落盘并同步计算 SHA-256。
 	limit := int64(verified.Info.Archive.Size)
 	if s.cfg.MaxArchiveBytes < limit {
 		limit = s.cfg.MaxArchiveBytes
 	}
 	hasher := sha256.New()
 	bufPtr := releaseBufPool.Get().(*[]byte)
-	written, copyErr := io.CopyBuffer(io.MultiWriter(archiveFile, hasher), io.LimitReader(archiveReader, limit+1), *bufPtr)
+	written, copyErr := copyStreamWithContext(ctx, io.MultiWriter(archiveFile, hasher), io.LimitReader(archiveReader, limit+1), *bufPtr)
 	releaseBufPool.Put(bufPtr)
 	if copyErr != nil {
-		archiveFile.Close()
-		return nil, fmt.Errorf("stream archive upload: %w", copyErr)
+		_ = archiveFile.Close()
+		return nil, mapStorageIOError("stream archive upload", copyErr)
 	}
 	if written > limit {
-		archiveFile.Close()
+		_ = archiveFile.Close()
 		return nil, wrapReleaseErr(errArchiveTooLarge, "archive exceeds declared or configured size limit")
 	}
+	if afterArchive != nil {
+		if err := afterArchive(); err != nil {
+			_ = archiveFile.Close()
+			return nil, err
+		}
+	}
 	if uint64(written) != verified.Info.Archive.Size {
-		archiveFile.Close()
+		_ = archiveFile.Close()
 		return nil, wrapReleaseErr(errVerifyFailed, "archive size mismatch: uploaded %d want %d", written, verified.Info.Archive.Size)
 	}
 	actualSHA256 := hex.EncodeToString(hasher.Sum(nil))
 	if actualSHA256 != verified.Info.Archive.SHA256 {
-		archiveFile.Close()
+		_ = archiveFile.Close()
 		return nil, wrapReleaseErr(errVerifyFailed, "archive sha256 mismatch")
 	}
 	if err := archiveFile.Sync(); err != nil {
-		archiveFile.Close()
-		return nil, fmt.Errorf("fsync archive: %w", err)
+		_ = archiveFile.Close()
+		return nil, mapStorageIOError("fsync archive", err)
 	}
 
-	// 零落盘流式校验 ZIP 中央目录与全树内容。
-	if err := verifyReleaseArchiveStreaming(archiveFile, written, verified); err != nil {
-		archiveFile.Close()
+	// 零落盘流式校验 ZIP 中央目录与全树内容（检查上下文取消）。
+	if err := verifyReleaseArchiveStreaming(ctx, archiveFile, written, verified); err != nil {
+		_ = archiveFile.Close()
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, wrapReleaseErr(errVerifyFailed, "%v", err)
 	}
 	if err := archiveFile.Close(); err != nil {
-		return nil, fmt.Errorf("close archive: %w", err)
+		return nil, mapStorageIOError("close archive", err)
 	}
 
 	manifestStagePath := filepath.Join(stageDir, "manifest.json")
 	if err := writeFileSync(manifestStagePath, verified.Envelope, 0o644); err != nil {
-		return nil, fmt.Errorf("write manifest file: %w", err)
+		return nil, mapStorageIOError("write manifest file", err)
 	}
 	if err := os.Chmod(archiveStagePath, 0o644); err != nil {
 		return nil, fmt.Errorf("chmod archive: %w", err)
@@ -660,14 +805,29 @@ func (s *releaseStore) publishStreaming(
 	if err := os.Chmod(stageDir, 0o755); err != nil {
 		return nil, fmt.Errorf("chmod version stage dir: %w", err)
 	}
+	if err := syncDir(stageDir); err != nil {
+		return nil, mapStorageIOError("fsync stage dir", err)
+	}
+
+	// 在进入不可逆的目录移动与状态提交之前，最后检查一次请求取消。
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	targetDir := s.versionDir(ver)
 	if err := os.Rename(stageDir, targetDir); err != nil {
-		return nil, fmt.Errorf("atomic rename version dir: %w", err)
+		return nil, mapStorageIOError("atomic rename version dir", err)
 	}
 	cleanupStage = false
+	rollbackTarget := true
+	defer func() {
+		if rollbackTarget {
+			_ = safeRemoveAllNoSymlink(targetDir)
+		}
+	}()
+
 	if err := syncDir(s.versionsDir()); err != nil {
-		return nil, fmt.Errorf("fsync versions dir: %w", err)
+		return nil, mapStorageIOError("fsync versions dir", err)
 	}
 
 	nowStr := utcNow(s.now())
@@ -675,6 +835,7 @@ func (s *releaseStore) publishStreaming(
 		Version:              ver,
 		Filename:             verified.Filename,
 		ArchiveSize:          written,
+		ManifestSize:         int64(len(verified.Envelope)),
 		UnpackedSize:         verified.Info.Archive.UnpackedSize,
 		ArchiveSHA256:        actualSHA256,
 		ManifestSHA256:       verified.ManifestSHA256,
@@ -683,6 +844,11 @@ func (s *releaseStore) publishStreaming(
 		MinUpgradableVersion: verified.Info.MinUpgradableVersion,
 	}
 	curState.Versions[ver] = rec
+	curState.History[ver] = releaseHistoryEntry{
+		ArchiveSHA256:    actualSHA256,
+		ManifestSHA256:   verified.ManifestSHA256,
+		FirstPublishedAt: nowStr,
+	}
 	if activate {
 		if channel == "stable" && curState.Channels["stable"] != "" && curState.Channels["stable"] != ver {
 			curState.PreviousStable = curState.Channels["stable"]
@@ -690,7 +856,11 @@ func (s *releaseStore) publishStreaming(
 		curState.Channels[channel] = ver
 	}
 
-	evicted, err := s.commitAndGCLocked(curState)
+	// 新发布版本自身进入本次 GC 保护集合，避免 --no-activate 刚入库即被当场淘汰。
+	evicted, stateCommitted, err := s.commitAndGCLocked(curState, map[string][]byte{ver: verified.Envelope}, ver)
+	if stateCommitted {
+		rollbackTarget = false
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -733,11 +903,11 @@ func (s *releaseStore) activateChannel(channel, version, actor string) (*release
 	if !isValidReleaseVersionString(version) {
 		return nil, wrapReleaseErr(errVersionNotFound, "invalid version format")
 	}
-	unlock, err := s.acquireExclusiveLock()
+	releaseSlot, err := s.tryAcquireWriteSlot()
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer releaseSlot()
 
 	s.stateMu.Lock()
 	curState := cloneReleaseState(s.state)
@@ -747,8 +917,8 @@ func (s *releaseStore) activateChannel(channel, version, actor string) (*release
 	if !ok {
 		return nil, wrapReleaseErr(errVersionNotFound, "version %s is not stored", version)
 	}
-	// 切换前二次复验磁盘签名与归档体积。
-	if _, err := s.verifyStoredVersionOnDisk(rec); err != nil {
+	envBytes, _, err := s.verifyStoredVersionOnDisk(rec)
+	if err != nil {
 		return nil, wrapReleaseErr(errVerifyFailed, "stored release %s failed verification: %v", version, err)
 	}
 
@@ -758,7 +928,7 @@ func (s *releaseStore) activateChannel(channel, version, actor string) (*release
 	}
 	curState.Channels[channel] = version
 
-	if err := s.commitStateLocked(curState); err != nil {
+	if _, err := s.commitStateLocked(curState, map[string][]byte{version: envBytes}); err != nil {
 		return nil, err
 	}
 	s.appendAudit(releaseAuditEntry{
@@ -777,11 +947,11 @@ func (s *releaseStore) deleteVersion(version, actor string) error {
 	if !isValidReleaseVersionString(version) {
 		return wrapReleaseErr(errVersionNotFound, "invalid version format")
 	}
-	unlock, err := s.acquireExclusiveLock()
+	releaseSlot, err := s.tryAcquireWriteSlot()
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer releaseSlot()
 
 	s.stateMu.Lock()
 	curState := cloneReleaseState(s.state)
@@ -799,7 +969,7 @@ func (s *releaseStore) deleteVersion(version, actor string) error {
 	if curState.PreviousStable == version {
 		curState.PreviousStable = ""
 	}
-	if err := s.commitStateLocked(curState); err != nil {
+	if _, err := s.commitStateLocked(curState, nil); err != nil {
 		return err
 	}
 	if err := safeRemoveAllNoSymlink(s.versionDir(version)); err != nil {
@@ -815,17 +985,17 @@ func (s *releaseStore) deleteVersion(version, actor string) error {
 }
 
 func (s *releaseStore) runGC(actor string) ([]string, error) {
-	unlock, err := s.acquireExclusiveLock()
+	releaseSlot, err := s.tryAcquireWriteSlot()
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer releaseSlot()
 
 	s.stateMu.Lock()
 	curState := cloneReleaseState(s.state)
 	s.stateMu.Unlock()
 
-	evicted, err := s.commitAndGCLocked(curState)
+	evicted, _, err := s.commitAndGCLocked(curState, nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -838,22 +1008,24 @@ func (s *releaseStore) runGC(actor string) ([]string, error) {
 	return evicted, nil
 }
 
-func (s *releaseStore) commitStateLocked(next *releaseState) error {
-	snap, err := s.buildSnapshotLocked(next)
+// commitStateLocked 严格区分 Rename(state) 前后边界：
+// Rename 成功即立刻同步内存状态与快照，绝不出现磁盘已变而内存仍用旧状态的分裂。
+func (s *releaseStore) commitStateLocked(next *releaseState, verifiedManifests map[string][]byte) (bool, error) {
+	snap, err := s.buildSnapshotFromVerified(next, verifiedManifests)
 	if err != nil {
-		return err
+		return false, err
 	}
-	if err := s.saveStateLocked(next); err != nil {
-		return err
+	renamed, saveErr := s.saveStateAtomicWithFlag(next)
+	if renamed {
+		s.stateMu.Lock()
+		s.state = next
+		s.stateMu.Unlock()
+		s.snapshot.Store(snap)
 	}
-	s.stateMu.Lock()
-	s.state = next
-	s.stateMu.Unlock()
-	s.snapshot.Store(snap)
-	return nil
+	return renamed, saveErr
 }
 
-func (s *releaseStore) commitAndGCLocked(next *releaseState) ([]string, error) {
+func (s *releaseStore) commitAndGCLocked(next *releaseState, verifiedManifests map[string][]byte, extraProtected string) ([]string, bool, error) {
 	protected := map[string]bool{}
 	for _, ch := range []string{"stable", "beta"} {
 		if v := next.Channels[ch]; v != "" {
@@ -863,16 +1035,18 @@ func (s *releaseStore) commitAndGCLocked(next *releaseState) ([]string, error) {
 	if next.PreviousStable != "" {
 		protected[next.PreviousStable] = true
 	}
+	if extraProtected != "" {
+		protected[extraProtected] = true
+	}
 
 	var totalBytes int64
 	candidates := make([]*releaseRecord, 0, len(next.Versions))
 	for _, rec := range next.Versions {
-		totalBytes += rec.ArchiveSize
+		totalBytes += rec.ArchiveSize + rec.ManifestSize
 		if !protected[rec.Version] {
 			candidates = append(candidates, rec)
 		}
 	}
-	// 由旧到新淘汰不在保护集合中的历史版本。
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].PublishedAt != candidates[j].PublishedAt {
 			return candidates[i].PublishedAt < candidates[j].PublishedAt
@@ -886,29 +1060,32 @@ func (s *releaseStore) commitAndGCLocked(next *releaseState) ([]string, error) {
 			break
 		}
 		delete(next.Versions, rec.Version)
-		totalBytes -= rec.ArchiveSize
+		totalBytes -= rec.ArchiveSize + rec.ManifestSize
 		evicted = append(evicted, rec.Version)
 	}
 
-	// 先原子提交索引与内存快照，再物理删除已摘除版本目录。
-	if err := s.commitStateLocked(next); err != nil {
-		return nil, err
+	committed, err := s.commitStateLocked(next, verifiedManifests)
+	if !committed {
+		return nil, false, err
 	}
 	for _, ver := range evicted {
-		if err := safeRemoveAllNoSymlink(s.versionDir(ver)); err != nil {
-			fmt.Fprintf(os.Stderr, "release gc remove %s warning: %v\n", ver, err)
+		if rmErr := safeRemoveAllNoSymlink(s.versionDir(ver)); rmErr != nil {
+			fmt.Fprintf(os.Stderr, "release gc remove %s warning: %v\n", ver, rmErr)
 		}
 	}
-	return evicted, nil
+	return evicted, true, err
 }
 
 func (s *releaseStore) appendAudit(entry releaseAuditEntry) {
+	if err := rejectIfSymlink(s.auditPath()); err != nil {
+		return
+	}
 	line, err := json.Marshal(entry)
 	if err != nil {
 		return
 	}
 	line = append(line, '\n')
-	if info, err := os.Stat(s.auditPath()); err == nil && info.Size() >= releaseAuditMaxBytes {
+	if info, err := os.Lstat(s.auditPath()); err == nil && info.Mode().IsRegular() && info.Size() >= releaseAuditMaxBytes {
 		_ = os.Rename(s.auditPath(), s.auditPath()+".1")
 	}
 	f, err := os.OpenFile(s.auditPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -919,10 +1096,45 @@ func (s *releaseStore) appendAudit(entry releaseAuditEntry) {
 	_ = f.Close()
 }
 
+func copyStreamWithContext(ctx context.Context, dst io.Writer, src io.Reader, buf []byte) (int64, error) {
+	var written int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return written, err
+		}
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				return written, ew
+			}
+			if nr != nw {
+				return written, io.ErrShortWrite
+			}
+		}
+		if er == io.EOF {
+			return written, nil
+		}
+		if er != nil {
+			return written, er
+		}
+	}
+}
+
+func mapStorageIOError(action string, err error) error {
+	if errors.Is(err, syscall.ENOSPC) {
+		return wrapReleaseErr(errInsufficientStorage, "%s: no space left on device", action)
+	}
+	return fmt.Errorf("%s: %w", action, err)
+}
+
 func requiredDiskBytesForArchive(archiveSize uint64, minFreeBytes uint64) uint64 {
 	const bufferBytes = uint64(256 << 20) // 256 MiB
 	need := archiveSize*2 + bufferBytes
-	if need < archiveSize { // 溢出保护
+	if need < archiveSize {
 		return ^uint64(0)
 	}
 	if minFreeBytes > need {
@@ -937,6 +1149,7 @@ func cloneReleaseState(src *releaseState) *releaseState {
 		Channels:       make(map[string]string, len(src.Channels)),
 		PreviousStable: src.PreviousStable,
 		Versions:       make(map[string]*releaseRecord, len(src.Versions)),
+		History:        make(map[string]releaseHistoryEntry, len(src.History)),
 	}
 	for k, v := range src.Channels {
 		dst.Channels[k] = v
@@ -944,6 +1157,9 @@ func cloneReleaseState(src *releaseState) *releaseState {
 	for k, v := range src.Versions {
 		c := *v
 		dst.Versions[k] = &c
+	}
+	for k, v := range src.History {
+		dst.History[k] = v
 	}
 	return dst
 }
@@ -954,11 +1170,11 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()

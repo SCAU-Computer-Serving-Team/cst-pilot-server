@@ -86,6 +86,7 @@ func serve() error {
 		if err != nil {
 			return err
 		}
+		defer relStore.close()
 		relGuard = newReleaseGuard(relCfg, nil)
 	}
 	server := newTelemetryServer(serverOptions{

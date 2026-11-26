@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -91,55 +92,46 @@ func (h *releaseHandlers) handleArchiveFile(w http.ResponseWriter, r *http.Reque
 	}
 
 	etag := `"` + entry.ArchiveSHA256 + `"`
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, entry.Filename))
-	w.Header().Set("ETag", etag)
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	if etagMatches(r.Header.Get("If-None-Match"), etag) {
+	// 仅在无 If-Match 前置条件时允许基于 ETag 的 304 快速省流判断。
+	if r.Header.Get("If-Match") == "" && etagMatches(r.Header.Get("If-None-Match"), etag) {
 		setWriteDeadline(w, 15*time.Second)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
+
 	if r.Method == http.MethodHead {
 		setWriteDeadline(w, 15*time.Second)
+		setArchiveResponseHeaders(w, entry, etag)
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Length", strconv.FormatInt(entry.ArchiveSize, 10))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	clientIP := releaseClientIP(r, h.store.cfg.TrustProxy)
-	decision, retryAfter := h.guard.allowFileDownload(clientIP, entry.ArchiveSize)
-	if decision != downloadAllowed {
-		setWriteDeadline(w, 15*time.Second)
-		w.Header().Del("Content-Disposition")
-		w.Header().Del("ETag")
-		w.Header().Del("Cache-Control")
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-		if decision == downloadDenyRateLimited {
-			sendJSON(w, http.StatusTooManyRequests, errorBody("rate_limited", "too many download requests"))
-		} else {
-			sendJSON(w, http.StatusServiceUnavailable, errorBody("bandwidth_budget_exceeded", "release download budget temporarily exhausted"))
-		}
-		return
-	}
-
+	// Nginx X-Accel-Redirect 模式：鉴权限流与流量记账后交由内部 location 零拷贝发送。
 	if h.store.cfg.AccelPrefix != "" {
+		clientIP := releaseClientIP(r, h.store.cfg.TrustProxy)
+		decision, retryAfter := h.guard.allowFileDownload(clientIP, entry.ArchiveSize)
+		if decision != downloadAllowed {
+			setWriteDeadline(w, 15*time.Second)
+			writeDownloadDenied(w, decision, retryAfter)
+			return
+		}
 		setWriteDeadline(w, 15*time.Second)
-		accelPath := h.store.cfg.AccelPrefix + "/" + releaseVersionsDir + "/" + entry.Version + "/" + entry.Filename
+		setArchiveResponseHeaders(w, entry, etag)
+		// 内部 alias 指向 /var/lib/cst-releases/versions/，仅暴露版本目录。
+		accelPath := h.store.cfg.AccelPrefix + "/" + entry.Version + "/" + entry.Filename
 		w.Header().Set("X-Accel-Redirect", accelPath)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Go 原生直出模式（本地/测试/无 Nginx）：信号量隔离 + 滑动写超时 + sendfile ServeContent。
+	// Go 原生直出模式：先占并发槽并打开验证文件，再扣流量预算，失败路径不消耗预算。
 	if !h.guard.acquireDirectSlot() {
 		setWriteDeadline(w, 15*time.Second)
-		w.Header().Del("Content-Disposition")
-		w.Header().Del("ETag")
-		w.Header().Del("Cache-Control")
 		w.Header().Set("Retry-After", "5")
 		sendJSON(w, http.StatusServiceUnavailable, errorBody("server_busy", "too many concurrent downloads"))
 		return
@@ -149,41 +141,65 @@ func (h *releaseHandlers) handleArchiveFile(w http.ResponseWriter, r *http.Reque
 	info, err := os.Lstat(entry.ArchivePath)
 	if err != nil || !info.Mode().IsRegular() {
 		setWriteDeadline(w, 15*time.Second)
-		w.Header().Del("Content-Disposition")
-		w.Header().Del("ETag")
-		w.Header().Del("Cache-Control")
 		sendJSON(w, http.StatusNotFound, errorBody("release_not_found", "release archive unavailable"))
 		return
 	}
 	file, err := os.Open(entry.ArchivePath)
 	if err != nil {
 		setWriteDeadline(w, 15*time.Second)
-		w.Header().Del("Content-Disposition")
-		w.Header().Del("ETag")
-		w.Header().Del("Cache-Control")
 		sendJSON(w, http.StatusNotFound, errorBody("release_not_found", "release archive unavailable"))
 		return
 	}
 	defer file.Close()
+	if fInfo, err := file.Stat(); err != nil || !fInfo.Mode().IsRegular() || fInfo.Size() != entry.ArchiveSize {
+		setWriteDeadline(w, 15*time.Second)
+		sendJSON(w, http.StatusNotFound, errorBody("release_not_found", "release archive unavailable"))
+		return
+	}
 
+	clientIP := releaseClientIP(r, h.store.cfg.TrustProxy)
+	decision, retryAfter := h.guard.allowFileDownload(clientIP, entry.ArchiveSize)
+	if decision != downloadAllowed {
+		setWriteDeadline(w, 15*time.Second)
+		writeDownloadDenied(w, decision, retryAfter)
+		return
+	}
+
+	setArchiveResponseHeaders(w, entry, etag)
 	modTime := info.ModTime()
 	if t, err := time.Parse(time.RFC3339Nano, entry.PublishedAt); err == nil {
 		modTime = t
 	}
-	wrapped := &slidingDeadlineResponseWriter{
-		ResponseWriter: w,
-		rc:             http.NewResponseController(w),
-		hardDeadline:   time.Now().Add(releaseDownloadTotalTimeout),
-		step:           releaseDownloadStepTimeout,
+	// 放宽连接写截止至大包总下载超时上限，保留底层 *os.File -> net.Conn 的 Linux sendfile 零拷贝能力。
+	setWriteDeadline(w, releaseDownloadTotalTimeout)
+	http.ServeContent(w, r, entry.Filename, modTime, file)
+}
+
+func setArchiveResponseHeaders(w http.ResponseWriter, entry *fileSnapshot, etag string) {
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, entry.Filename))
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+func writeDownloadDenied(w http.ResponseWriter, decision downloadDecision, retryAfter int) {
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	if decision == downloadDenyRateLimited {
+		sendJSON(w, http.StatusTooManyRequests, errorBody("rate_limited", "too many download requests"))
+	} else {
+		sendJSON(w, http.StatusServiceUnavailable, errorBody("bandwidth_budget_exceeded", "release download budget temporarily exhausted"))
 	}
-	wrapped.bump()
-	http.ServeContent(wrapped, r, entry.Filename, modTime, file)
 }
 
 func (h *releaseHandlers) authorizeAdmin(w http.ResponseWriter, r *http.Request) (string, bool) {
 	ok, disabled, limited, retryAfter := h.guard.checkAdminToken(r)
 	if ok {
 		return "admin-http:" + releaseClientIP(r, h.store.cfg.TrustProxy), true
+	}
+	setWriteDeadline(w, 15*time.Second)
+	if r.Method == http.MethodPost {
+		w.Header().Set("Connection", "close")
 	}
 	if disabled {
 		sendJSON(w, http.StatusServiceUnavailable, errorBody("admin_disabled", "release admin token is not configured"))
@@ -209,7 +225,8 @@ func (h *releaseHandlers) handleAdminRoot(w http.ResponseWriter, r *http.Request
 		resp["bandwidth"] = h.guard.budgetStatus()
 		sendJSON(w, http.StatusOK, resp)
 	case http.MethodPost:
-		setWriteDeadline(w, 30*time.Second)
+		// 鉴权前先施加短读超时防止未鉴权慢连接占坑；鉴权后再进入上传看门狗。
+		setRouteDeadlines(w, 10*time.Second, 30*time.Second)
 		actor, ok := h.authorizeAdmin(w, r)
 		if !ok {
 			return
@@ -257,18 +274,21 @@ func (h *releaseHandlers) handleAdminSubpath(w http.ResponseWriter, r *http.Requ
 			sendJSON(w, http.StatusBadRequest, errorBody("invalid_body", "cannot read request body"))
 			return
 		}
-		if err := validateStrictJSON(body); err != nil {
+		obj, err := parseStrictJSONObject(body)
+		if err != nil {
 			sendJSON(w, http.StatusBadRequest, errorBody("invalid_json", err.Error()))
 			return
 		}
-		var req struct {
-			Version string `json:"version"`
+		if err := requireExactKeys(obj, "version"); err != nil {
+			sendJSON(w, http.StatusBadRequest, errorBody("invalid_json", err.Error()))
+			return
 		}
-		if err := decodeStrictJSONStruct(body, &req); err != nil || req.Version == "" {
+		version, err := requireJSONString(obj, "version")
+		if err != nil || version == "" {
 			sendJSON(w, http.StatusBadRequest, errorBody("invalid_json", "version is required"))
 			return
 		}
-		rec, err := h.store.activateChannel(channel, req.Version, actor)
+		rec, err := h.store.activateChannel(channel, version, actor)
 		if err != nil {
 			sendReleaseError(w, err)
 			return
@@ -295,13 +315,20 @@ func (h *releaseHandlers) handleAdminSubpath(w http.ResponseWriter, r *http.Requ
 }
 
 func (h *releaseHandlers) handleAdminPublish(w http.ResponseWriter, r *http.Request, actor string) {
+	abortPublish := func(status int, code, msg string) {
+		// 提前拒绝时关闭 HTTP/1.1 连接且不排空大请求体，立即释放内存与连接。
+		w.Header().Set("Connection", "close")
+		setWriteDeadline(w, 15*time.Second)
+		sendJSON(w, status, errorBody(code, msg))
+	}
+
 	q := r.URL.Query()
 	channel := q.Get("channel")
 	if channel == "" {
 		channel = "stable"
 	}
 	if !isValidReleaseChannel(channel) {
-		sendJSON(w, http.StatusBadRequest, errorBody("invalid_channel", "channel must be stable or beta"))
+		abortPublish(http.StatusBadRequest, "invalid_channel", "channel must be stable or beta")
 		return
 	}
 	activate := true
@@ -312,15 +339,30 @@ func (h *releaseHandlers) handleAdminPublish(w http.ResponseWriter, r *http.Requ
 		case "false", "0":
 			activate = false
 		default:
-			sendJSON(w, http.StatusBadRequest, errorBody("invalid_parameter", "activate must be true or false"))
+			abortPublish(http.StatusBadRequest, "invalid_parameter", "activate must be true or false")
 			return
 		}
 	}
 
-	// 流式读看门狗：总上传限时 10m，每次读进展续期 30s。
+	// 在读取任何 multipart 数据前先拿独占发布槽，防止并发请求各自读 8 MiB 清单挤占 48 MiB 堆内存。
+	releaseSlot, err := h.store.tryAcquireWriteSlot()
+	if err != nil {
+		abortPublish(http.StatusConflict, "publish_in_progress", err.Error())
+		return
+	}
+	defer releaseSlot()
+
+	// 上传与校验阶段移除提前设定的 30 秒写截止，等准备发送最终响应时再设新鲜写截止，避免慢上传后发 201 超时。
 	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+
+	ctx, cancel := context.WithTimeout(r.Context(), releaseUploadTotalTimeout)
+	defer cancel()
+
+	// 叠加请求体总上限（manifest + archive + multipart 封装余量）与滑动读超时。
+	maxBodyBytes := int64(maxManifestBytes) + h.store.cfg.MaxArchiveBytes + (1 << 20)
 	readWatchdog := &slidingDeadlineReader{
-		r:            r.Body,
+		r:            io.LimitReader(r.Body, maxBodyBytes+1),
 		rc:           rc,
 		hardDeadline: time.Now().Add(releaseUploadTotalTimeout),
 		step:         releaseUploadStepTimeout,
@@ -330,56 +372,59 @@ func (h *releaseHandlers) handleAdminPublish(w http.ResponseWriter, r *http.Requ
 
 	mr, err := r.MultipartReader()
 	if err != nil {
-		sendJSON(w, http.StatusBadRequest, errorBody("invalid_multipart", "request must be multipart/form-data"))
+		abortPublish(http.StatusBadRequest, "invalid_multipart", "request must be multipart/form-data")
 		return
 	}
 
-	// 第 1 段必须为 manifest，先读出验签查重，拒绝时不落盘 ZIP。
+	// 第 1 段必须为 manifest，拒绝路径不调用会排空整段的 Part.Close()。
 	firstPart, err := mr.NextPart()
 	if err != nil {
-		sendJSON(w, http.StatusBadRequest, errorBody("invalid_multipart", "missing manifest part"))
+		abortPublish(http.StatusBadRequest, "invalid_multipart", "missing manifest part")
 		return
 	}
 	if firstPart.FormName() != "manifest" {
-		_ = firstPart.Close()
-		sendJSON(w, http.StatusBadRequest, errorBody("invalid_multipart", "first multipart field must be manifest"))
+		abortPublish(http.StatusBadRequest, "invalid_multipart", "first multipart field must be manifest")
 		return
 	}
 	manifestBytes, err := io.ReadAll(io.LimitReader(firstPart, maxManifestBytes+1))
-	_ = firstPart.Close()
 	if err != nil {
-		sendJSON(w, http.StatusBadRequest, errorBody("invalid_body", "failed reading manifest part"))
+		abortPublish(http.StatusBadRequest, "invalid_body", "failed reading manifest part")
 		return
 	}
 	if len(manifestBytes) > maxManifestBytes {
-		sendJSON(w, http.StatusRequestEntityTooLarge, errorBody("manifest_too_large", "manifest exceeds 8 MiB limit"))
+		abortPublish(http.StatusRequestEntityTooLarge, "manifest_too_large", "manifest exceeds 8 MiB limit")
 		return
 	}
 
-	var archivePart io.ReadCloser
-	defer func() {
-		if archivePart != nil {
-			_ = archivePart.Close()
-		}
-	}()
 	nextArchive := func() (io.Reader, error) {
 		part, err := mr.NextPart()
 		if err != nil {
 			return nil, wrapReleaseErr(errInvalidMultipart, "missing archive part after manifest")
 		}
 		if part.FormName() != "archive" {
-			_ = part.Close()
 			return nil, wrapReleaseErr(errInvalidMultipart, "second multipart field must be archive")
 		}
-		archivePart = part
 		return part, nil
 	}
+	afterArchive := func() error {
+		extra, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return wrapReleaseErr(errInvalidMultipart, "malformed multipart boundary after archive")
+		}
+		return wrapReleaseErr(errInvalidMultipart, "unexpected extra multipart field %q", extra.FormName())
+	}
 
-	res, err := h.store.publishStreaming(channel, activate, manifestBytes, nextArchive, actor)
+	res, err := h.store.publishStreamingLocked(ctx, channel, activate, manifestBytes, nextArchive, afterArchive, actor)
 	if err != nil {
+		w.Header().Set("Connection", "close")
+		setWriteDeadline(w, 15*time.Second)
 		sendReleaseError(w, err)
 		return
 	}
+	setWriteDeadline(w, 30*time.Second)
 	sendJSON(w, http.StatusCreated, res)
 }
 
@@ -387,6 +432,10 @@ var errInvalidMultipart = errors.New("invalid_multipart")
 
 func sendReleaseError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, context.Canceled):
+		sendJSON(w, http.StatusRequestTimeout, errorBody("request_canceled", "upload canceled by client"))
+	case errors.Is(err, context.DeadlineExceeded):
+		sendJSON(w, http.StatusRequestTimeout, errorBody("upload_timeout", "upload processing exceeded deadline"))
 	case errors.Is(err, errInvalidChannel):
 		sendJSON(w, http.StatusBadRequest, errorBody("invalid_channel", err.Error()))
 	case errors.Is(err, errInvalidMultipart):
@@ -454,44 +503,6 @@ func (s *slidingDeadlineReader) bump() {
 }
 
 func (s *slidingDeadlineReader) Read(p []byte) (int, error) {
-	s.bump()
-	return s.r.Read(p)
-}
-
-type slidingDeadlineResponseWriter struct {
-	http.ResponseWriter
-	rc           *http.ResponseController
-	hardDeadline time.Time
-	step         time.Duration
-}
-
-func (s *slidingDeadlineResponseWriter) bump() {
-	next := time.Now().Add(s.step)
-	if next.After(s.hardDeadline) {
-		next = s.hardDeadline
-	}
-	_ = s.rc.SetWriteDeadline(next)
-}
-
-func (s *slidingDeadlineResponseWriter) Write(p []byte) (int, error) {
-	s.bump()
-	return s.ResponseWriter.Write(p)
-}
-
-func (s *slidingDeadlineResponseWriter) ReadFrom(r io.Reader) (int64, error) {
-	s.bump()
-	if rf, ok := s.ResponseWriter.(io.ReaderFrom); ok {
-		return rf.ReadFrom(&slidingCopyReader{r: r, bump: s.bump})
-	}
-	return io.Copy(s.ResponseWriter, &slidingCopyReader{r: r, bump: s.bump})
-}
-
-type slidingCopyReader struct {
-	r    io.Reader
-	bump func()
-}
-
-func (s *slidingCopyReader) Read(p []byte) (int, error) {
 	s.bump()
 	return s.r.Read(p)
 }

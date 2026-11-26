@@ -196,10 +196,19 @@ limit_req_zone  $binary_remote_addr zone=cst_rel_admin_req:5m     rate=6r/m;
 ```nginx
 # https://www.cstoa.top 的 server {} 块内新增路由
 
+# 限流结构化 JSON 响应（供 limit_req / limit_conn 触发 429 时返回标准信封）
+location @cst_rel_429 {
+    default_type application/json;
+    add_header Retry-After "10" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    return 429 '{"error":{"code":"rate_limited","message":"too many requests"}}';
+}
+
 # 1. stable 通道清单（客户端默认 CST_UPDATE_MANIFEST_URL）
 location = /api/agent/releases/latest {
     limit_req zone=cst_rel_manifest_req burst=20 nodelay;
     limit_req_status 429;
+    error_page 429 = @cst_rel_429;
     proxy_pass http://127.0.0.1:8787/v1/releases/channels/stable/latest;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -212,6 +221,7 @@ location = /api/agent/releases/latest {
 location = /api/agent/releases/beta {
     limit_req zone=cst_rel_manifest_req burst=20 nodelay;
     limit_req_status 429;
+    error_page 429 = @cst_rel_429;
     proxy_pass http://127.0.0.1:8787/v1/releases/channels/beta/latest;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -227,6 +237,7 @@ location ^~ /api/agent/releases/files/ {
     limit_conn_status 429;
     limit_req zone=cst_rel_file_req burst=6 nodelay;
     limit_req_status 429;
+    error_page 429 = @cst_rel_429;
 
     proxy_pass http://127.0.0.1:8787/v1/releases/files/;
     proxy_http_version 1.1;
@@ -236,15 +247,19 @@ location ^~ /api/agent/releases/files/ {
     proxy_read_timeout 15s;
 }
 
-# 4. 内部只读零拷贝目录（公网直访固定返回 404）
+# 4. 内部只读零拷贝版本目录（仅暴露 versions/，禁用符号链接，公网直访固定返回 404）
 location ^~ /_internal/cst-releases/ {
     internal;
-    alias /var/lib/cst-releases/;
+    alias /var/lib/cst-releases/versions/;
+    disable_symlinks on;
     sendfile on;
     sendfile_max_chunk 1m;
     tcp_nopush on;
     tcp_nodelay on;
     gzip off;
+    etag off;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header ETag $upstream_http_etag always;
     # 常规压缩包 43 到 60 MiB 全程满速跑完；仅对超出 65 MiB 的异常连接降速
     limit_rate_after 65m;
     limit_rate 2m;
@@ -272,8 +287,8 @@ location ^~ /_internal/cst-releases/ {
 
 `deploy/cstoa/cst-telemetry.service` 仅需新增发行目录写权限并维持原有最小权限沙箱：
 
-1. `ReadWritePaths=/var/lib/cst-telemetry /var/lib/cst-releases`
-2. 目录 `/var/lib/cst-releases` 归属 `csttele:csttele`，权限 `0755`，其下 `.tmp/`、`state.json`、`.lock`、`audit.jsonl` 由 Go 进程显式设为 `0700` 或 `0600`，`versions/` 与已发布文件设为 `0755` / `0644`，Nginx worker 无需加入 `csttele` 组即可只读 `versions/` 且无法看到未完成上传文件。
+1. `ReadWritePaths=/var/lib/cst-telemetry -/var/lib/cst-releases`（前导 `-` 保证发行目录尚未创建时不影响纯遥测启动）
+2. 启用 Nginx 加速时在 `telemetry.env` 中同步设置 `RELEASE_TRUST_PROXY=1` 与 `RELEASE_ACCEL_PREFIX=/_internal/cst-releases`。目录 `/var/lib/cst-releases` 归属 `csttele:csttele`，权限 `0755`，其下 `.tmp/`、`state.json`、`.lock`、`audit.jsonl` 由 Go 进程显式设为 `0700` 或 `0600`，`versions/` 与已发布文件设为 `0755` / `0644`，Nginx 仅能只读 `versions/` 且禁用符号链接。
 3. 现有 `NoNewPrivileges=true`、`ProtectSystem=strict`、`ProtectHome=true`、`PrivateTmp=true` 全部保留。
 
 ### TLS 证书到期监控与续签检查项

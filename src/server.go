@@ -94,15 +94,27 @@ func newTelemetryServer(opts serverOptions) *http.Server {
 		}
 		handleUpload(w, r, opts)
 	})
-	if opts.releases != nil {
-		guard := opts.releaseGuard
-		if guard == nil {
-			guard = newReleaseGuard(opts.releases.cfg, opts.now)
+	if opts.releases == nil {
+		return &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      30 * time.Second,
+			IdleTimeout:       60 * time.Second,
 		}
-		registerReleaseRoutes(mux, opts.releases, guard)
 	}
+	guard := opts.releaseGuard
+	if guard == nil {
+		guard = newReleaseGuard(opts.releases.cfg, opts.now)
+	}
+	registerReleaseRoutes(mux, opts.releases, guard)
+	// 开启发行模块时最外层统一设定默认 30s 截止（覆盖未匹配 404 路由），上传与直出路由再按需调整。
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setRouteDeadlines(w, 30*time.Second, 30*time.Second)
+		mux.ServeHTTP(w, r)
+	})
 	return &http.Server{
-		Handler:           mux,
+		Handler:           wrapped,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}

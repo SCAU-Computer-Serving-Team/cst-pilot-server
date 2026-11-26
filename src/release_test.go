@@ -232,6 +232,7 @@ func newTestReleaseEnv(t *testing.T, mutateCfg func(*releaseConfig), freeFn func
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = relStore.close() })
 	relGuard := newReleaseGuard(cfg, nowFn)
 	telStore := testStore(t)
 	srv := newTelemetryServer(serverOptions{
@@ -413,7 +414,7 @@ func TestReleaseEndToEndPublishAndDualModeDownload(t *testing.T) {
 	reqAccel := httptest.NewRequest(http.MethodGet, "/v1/releases/files/"+b2.version+"/"+b2.filename, nil)
 	reqAccel.RemoteAddr = "198.51.100.11:2222"
 	srvAccel.Handler.ServeHTTP(rAccel, reqAccel)
-	wantRedirect := "/_internal/cst-releases/versions/v0.9.7/" + b2.filename
+	wantRedirect := "/_internal/cst-releases/v0.9.7/" + b2.filename
 	if rAccel.Code != http.StatusOK || rAccel.Body.Len() != 0 || rAccel.Header().Get("X-Accel-Redirect") != wantRedirect {
 		t.Fatalf("accel download = %d redirect=%q body=%d", rAccel.Code, rAccel.Header().Get("X-Accel-Redirect"), rAccel.Body.Len())
 	}
@@ -513,19 +514,19 @@ func TestReleaseDiskWatermarkAndConcurrentPublishLock(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, err := store.publishStreaming("stable", true, bA.manifestBytes, func() (io.Reader, error) {
+		_, err := store.publishStreaming(t.Context(), "stable", true, bA.manifestBytes, func() (io.Reader, error) {
 			close(started)
 			<-releaseGate
 			return bytes.NewReader(bA.archiveBytes), nil
-		}, "test-a")
+		}, nil, "test-a")
 		if err != nil {
 			t.Errorf("first publish failed: %v", err)
 		}
 	}()
 	<-started
-	_, err := store.publishStreaming("stable", true, bB.manifestBytes, func() (io.Reader, error) {
+	_, err := store.publishStreaming(t.Context(), "stable", true, bB.manifestBytes, func() (io.Reader, error) {
 		return bytes.NewReader(bB.archiveBytes), nil
-	}, "test-b")
+	}, nil, "test-b")
 	if err == nil || !strings.Contains(err.Error(), "in progress") {
 		t.Fatalf("expected publish_in_progress conflict, got %v", err)
 	}
@@ -600,10 +601,17 @@ func TestReleaseActivateRollbackGCProtectionAndRecovery(t *testing.T) {
 	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := openReleaseStoreWithHooks(store.cfg, clock, store.freeBytes)
+	// 关闭旧 store 释放生命周期锁后再重新打开，验证启动崩溃自愈。
+	cfgCopy := store.cfg
+	freeCopy := store.freeBytes
+	if err := store.close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := openReleaseStoreWithHooks(cfgCopy, clock, freeCopy)
 	if err != nil {
 		t.Fatalf("recovery failed: %v", err)
 	}
+	defer recovered.close()
 	if _, err := os.Stat(orphanDir); !os.IsNotExist(err) {
 		t.Fatal("expected orphan directory to be cleaned on startup")
 	}
@@ -697,8 +705,8 @@ func TestReleaseRateLimitBandwidthBudgetAndProxyIP(t *testing.T) {
 		t.Fatalf("expected download recovery after 61m, got %d %s", recC.Code, recC.Body.String())
 	}
 
-	// 管理鉴权失败 10 次触发 429 锁定。
-	for i := 0; i < adminAuthMaxFailures; i++ {
+	// 管理鉴权连续失败达到阈值（第 10 次）即触发 429 锁定。
+	for i := 0; i < adminAuthMaxFailures-1; i++ {
 		badReq := httptest.NewRequest(http.MethodGet, "/v1/admin/releases", nil)
 		badReq.RemoteAddr = "198.51.100.77:9999"
 		badReq.Header.Set("Authorization", "Bearer wrong-token")
@@ -708,13 +716,21 @@ func TestReleaseRateLimitBandwidthBudgetAndProxyIP(t *testing.T) {
 			t.Fatalf("fail #%d expected 401, got %d", i+1, badRec.Code)
 		}
 	}
+	badReq10 := httptest.NewRequest(http.MethodGet, "/v1/admin/releases", nil)
+	badReq10.RemoteAddr = "198.51.100.77:9999"
+	badReq10.Header.Set("Authorization", "Bearer wrong-token")
+	badRec10 := httptest.NewRecorder()
+	srvBudget.Handler.ServeHTTP(badRec10, badReq10)
+	if badRec10.Code != http.StatusTooManyRequests || badRec10.Header().Get("Retry-After") == "" {
+		t.Fatalf("10th failure expected 429 with Retry-After, got %d", badRec10.Code)
+	}
 	lockReq := httptest.NewRequest(http.MethodGet, "/v1/admin/releases", nil)
 	lockReq.RemoteAddr = "198.51.100.77:9999"
 	lockReq.Header.Set("Authorization", "Bearer "+testReleaseAdminToken)
 	lockRec := httptest.NewRecorder()
 	srvBudget.Handler.ServeHTTP(lockRec, lockReq)
 	if lockRec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429 after 10 admin failures, got %d", lockRec.Code)
+		t.Fatalf("expected 429 while locked out, got %d", lockRec.Code)
 	}
 }
 
@@ -751,5 +767,151 @@ func TestReleaseOfflineCLIWorkflow(t *testing.T) {
 	}
 	if err := releaseCmd([]string{"gc", "--offline"}); err != nil {
 		t.Fatalf("cli gc offline failed: %v", err)
+	}
+	// CLI 拒绝向远端明文 HTTP 发送管理令牌。
+	if err := releaseCmd([]string{"list", "--endpoint", "http://remote.example:8787"}); err == nil {
+		t.Fatal("expected CLI to reject remote plaintext HTTP endpoint")
+	}
+}
+
+func TestReleaseReviewRegressions(t *testing.T) {
+	// P1-01：同一存储目录只允许一个生命周期所有者进程，第二个 open 必须被拒绝。
+	_, store, _, priv := newTestReleaseEnv(t, nil, nil, nil)
+	if _, err := openReleaseStoreWithHooks(store.cfg, store.now, store.freeBytes); err == nil {
+		t.Fatal("expected second openReleaseStore on locked directory to fail")
+	}
+
+	// P1-02：Rename(state) 前失败回滚 targetDir，重试同版本成功；Rename(state) 后 fsync 失败时内存与磁盘仍同步。
+	b1 := buildValidReleaseBundle(t, priv, "v4.0.0", "v0.9.0", testReleaseBaseURL, nil, nil)
+	store.beforeStateRename = func() error { return fmt.Errorf("injected before state rename") }
+	if _, err := store.publishStreaming(t.Context(), "stable", true, b1.manifestBytes, func() (io.Reader, error) {
+		return bytes.NewReader(b1.archiveBytes), nil
+	}, nil, "test"); err == nil {
+		t.Fatal("expected publish to fail on beforeStateRename")
+	}
+	if _, err := os.Stat(store.versionDir("v4.0.0")); !os.IsNotExist(err) {
+		t.Fatal("expected target version dir rolled back when state rename did not happen")
+	}
+	store.beforeStateRename = nil
+	store.afterStateRename = func() error { return fmt.Errorf("injected post-rename sync error") }
+	if _, err := store.publishStreaming(t.Context(), "stable", true, b1.manifestBytes, func() (io.Reader, error) {
+		return bytes.NewReader(b1.archiveBytes), nil
+	}, nil, "test"); err == nil {
+		t.Fatal("expected error surfaced from afterStateRename")
+	}
+	store.afterStateRename = nil
+	if ch, ok := store.getChannel("stable"); !ok || ch.Version != "v4.0.0" {
+		t.Fatalf("memory snapshot diverged from committed disk state after state rename: %v %v", ok, ch)
+	}
+
+	// P1-06：拒绝大小写模糊键、缺失/null 必填字段、未配对 UTF-16 代理项与非规范 Base64。
+	if _, err := parseStrictSignedManifestEnvelope([]byte(`{"Payload":"x","signature":"y"}`)); err == nil {
+		t.Fatal("expected case-mismatched key Payload to be rejected")
+	}
+	if _, err := parseStrictReleaseManifest([]byte(`{"schemaVersion":1,"platform":"windows-x86_64","version":"v1.0.0","builtAt":"2026-11-26T09:00:00Z","minUpgradableVersion":"v0.9.0","releaseNotes":null,"archive":{"url":"https://www.cstoa.top/a","size":1,"unpackedSize":1,"sha256":"` + strings.Repeat("a", 64) + `"},"sha256Sums":"x","sha256Signature":"y"}`)); err == nil {
+		t.Fatal("expected null releaseNotes to be rejected")
+	}
+	if err := validateStrictJSON([]byte(`{"a":"\uD800"}`)); err == nil {
+		t.Fatal("expected unpaired UTF-16 surrogate to be rejected")
+	}
+	if _, err := decodeCanonicalStdBase64("YWJj\n"); err == nil {
+		t.Fatal("expected non-canonical base64 with newline to be rejected")
+	}
+
+	// P1-07：删除或 GC 后禁止同版本号复用。
+	b2 := buildValidReleaseBundle(t, priv, "v4.0.1", "v0.9.0", testReleaseBaseURL, nil, nil)
+	if _, err := store.publishStreaming(t.Context(), "beta", false, b2.manifestBytes, func() (io.Reader, error) {
+		return bytes.NewReader(b2.archiveBytes), nil
+	}, nil, "test"); err != nil {
+		t.Fatalf("publish v4.0.1 failed: %v", err)
+	}
+	if err := store.deleteVersion("v4.0.1", "test"); err != nil {
+		t.Fatalf("delete v4.0.1 failed: %v", err)
+	}
+	b2Reuse := buildValidReleaseBundle(t, priv, "v4.0.1", "v0.9.0", testReleaseBaseURL, map[string][]byte{
+		"app/prompts/APPEND_SYSTEM.md": []byte("# modified content\n"),
+	}, nil)
+	if _, err := store.publishStreaming(t.Context(), "beta", true, b2Reuse.manifestBytes, func() (io.Reader, error) {
+		return bytes.NewReader(b2Reuse.archiveBytes), nil
+	}, nil, "test"); err == nil || !strings.Contains(err.Error(), "previously published") {
+		t.Fatalf("expected version reuse to be rejected, got %v", err)
+	}
+
+	// P2-15：公共基址禁止空查询分隔符 ?。
+	if err := validateReleasePublicBaseURL("https://www.cstoa.top/api/agent/releases?"); err == nil {
+		t.Fatal("expected base URL with trailing ? to be rejected")
+	}
+
+	// P2-13：清单声明超过 MaxArchiveBytes 应返回 413 而非 422；多余 multipart 字段返回 400。
+	srvSmall, _, _, privSmall := newTestReleaseEnv(t, func(c *releaseConfig) {
+		c.MaxArchiveBytes = 1024 // 1 KiB
+	}, nil, nil)
+	bBig := buildValidReleaseBundle(t, privSmall, "v4.1.0", "v0.9.0", testReleaseBaseURL, nil, nil)
+	rBig := httptest.NewRecorder()
+	srvSmall.Handler.ServeHTTP(rBig, makeMultipartPublishRequest(t, "/v1/admin/releases", testReleaseAdminToken, bBig.manifestBytes, bBig.archiveBytes, bBig.filename))
+	if rBig.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rBig.Body.String(), `"archive_too_large"`) {
+		t.Fatalf("oversize declared archive expected 413, got %d %s", rBig.Code, rBig.Body.String())
+	}
+
+	// P2-16：加密 PKCS#8 私钥头与大写 .JSON 凭据键拦截。
+	srvSec, _, _, privSec := newTestReleaseEnv(t, nil, nil, nil)
+	bEncKey := buildValidReleaseBundle(t, privSec, "v4.2.0", "v0.9.0", testReleaseBaseURL, map[string][]byte{
+		"app/prompts/APPEND_SYSTEM.md": []byte("-----BEGIN ENCRYPTED PRIVATE KEY-----\nABC\n-----END ENCRYPTED PRIVATE KEY-----\n"),
+	}, nil)
+	rEnc := httptest.NewRecorder()
+	srvSec.Handler.ServeHTTP(rEnc, makeMultipartPublishRequest(t, "/v1/admin/releases", testReleaseAdminToken, bEncKey.manifestBytes, bEncKey.archiveBytes, bEncKey.filename))
+	if rEnc.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("encrypted private key expected 422, got %d", rEnc.Code)
+	}
+	bUpperJSON := buildValidReleaseBundle(t, privSec, "v4.2.1", "v0.9.0", testReleaseBaseURL, map[string][]byte{
+		"app/defaults/EXTRA.JSON": []byte(`{"token":"leaked"}`),
+	}, nil)
+	rUpper := httptest.NewRecorder()
+	srvSec.Handler.ServeHTTP(rUpper, makeMultipartPublishRequest(t, "/v1/admin/releases", testReleaseAdminToken, bUpperJSON.manifestBytes, bUpperJSON.archiveBytes, bUpperJSON.filename))
+	if rUpper.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("uppercase .JSON secret expected 422, got %d", rUpper.Code)
+	}
+
+	// P2-11：KeepCount 已满时 --no-activate 发布的新版本不应在同次事务被当场淘汰。
+	srvKeep, storeKeep, _, privKeep := newTestReleaseEnv(t, func(c *releaseConfig) {
+		c.KeepCount = 1
+	}, nil, nil)
+	bK1 := buildValidReleaseBundle(t, privKeep, "v5.0.0", "v0.9.0", testReleaseBaseURL, nil, nil)
+	rK1 := httptest.NewRecorder()
+	srvKeep.Handler.ServeHTTP(rK1, makeMultipartPublishRequest(t, "/v1/admin/releases?channel=stable&activate=true", testReleaseAdminToken, bK1.manifestBytes, bK1.archiveBytes, bK1.filename))
+	if rK1.Code != http.StatusCreated {
+		t.Fatalf("publish v5.0.0 failed: %d", rK1.Code)
+	}
+	bK2 := buildValidReleaseBundle(t, privKeep, "v5.0.1", "v0.9.0", testReleaseBaseURL, nil, nil)
+	rK2 := httptest.NewRecorder()
+	srvKeep.Handler.ServeHTTP(rK2, makeMultipartPublishRequest(t, "/v1/admin/releases?channel=stable&activate=false", testReleaseAdminToken, bK2.manifestBytes, bK2.archiveBytes, bK2.filename))
+	if rK2.Code != http.StatusCreated {
+		t.Fatalf("publish v5.0.1 (--no-activate) failed: %d", rK2.Code)
+	}
+	if _, ok := storeKeep.getFile("v5.0.1", bK2.filename); !ok {
+		t.Fatal("newly published --no-activate version v5.0.1 was immediately evicted")
+	}
+
+	// 真实 HTTP/1.1 连接验证：合法发布正常返回 201，提前拒绝带 Connection: close。
+	ts := httptest.NewServer(srvKeep.Handler)
+	defer ts.Close()
+	bLive := buildValidReleaseBundle(t, privKeep, "v5.0.2", "v0.9.0", testReleaseBaseURL, nil, nil)
+	var mp bytes.Buffer
+	mw := multipart.NewWriter(&mp)
+	p1, _ := mw.CreateFormFile("manifest", "m.json")
+	_, _ = p1.Write(bLive.manifestBytes)
+	p2, _ := mw.CreateFormFile("archive", bLive.filename)
+	_, _ = p2.Write(bLive.archiveBytes)
+	_ = mw.Close()
+	reqLive, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/admin/releases?channel=stable&activate=true", &mp)
+	reqLive.Header.Set("Authorization", "Bearer "+testReleaseAdminToken)
+	reqLive.Header.Set("Content-Type", mw.FormDataContentType())
+	respLive, err := ts.Client().Do(reqLive)
+	if err != nil {
+		t.Fatalf("live HTTP/1.1 publish failed: %v", err)
+	}
+	respLive.Body.Close()
+	if respLive.StatusCode != http.StatusCreated {
+		t.Fatalf("live HTTP/1.1 publish expected 201, got %d", respLive.StatusCode)
 	}
 }

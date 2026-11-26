@@ -3,9 +3,11 @@ package main
 
 import (
 	"crypto/subtle"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,8 +19,10 @@ const (
 	fileDownloadWindow   = 10 * time.Minute
 	fileDownloadMaxPerIP = 5
 	guardMapMaxEntries   = 2048
-	budgetBucketMinutes  = 24 * 60
-	budgetHourMinutes    = 60
+	// 多留 1 个边界分钟桶，保守保证满整 60 分钟 / 24 小时才释放尾部流量。
+	budgetBucketSlots = 24*60 + 1
+	budgetHourMinutes = 60
+	budgetDayMinutes  = 24 * 60
 )
 
 type downloadDecision int
@@ -44,9 +48,10 @@ type releaseGuard struct {
 	now func() time.Time
 
 	mu          sync.Mutex
+	lastNow     time.Time
 	adminFails  map[string]windowCounter
 	ipDownloads map[string]windowCounter
-	buckets     [budgetBucketMinutes]minuteTrafficBucket
+	buckets     [budgetBucketSlots]minuteTrafficBucket
 
 	directSlots chan struct{}
 }
@@ -68,77 +73,87 @@ func newReleaseGuard(cfg releaseConfig, nowFn func() time.Time) *releaseGuard {
 	}
 }
 
+func (g *releaseGuard) monotonicNowLocked() time.Time {
+	now := g.now()
+	if !g.lastNow.IsZero() && now.Before(g.lastNow) {
+		return g.lastNow
+	}
+	g.lastNow = now
+	return now
+}
+
+func ceilRetrySeconds(d time.Duration) int {
+	secs := int(math.Ceil(d.Seconds()))
+	if secs < 1 {
+		return 1
+	}
+	return secs
+}
+
+// checkAdminToken 锁外执行常数时间比对，锁内原子完成锁定判断与失败计数更新。
 func (g *releaseGuard) checkAdminToken(r *http.Request) (ok bool, disabled bool, rateLimited bool, retryAfter int) {
 	if g.cfg.AdminToken == "" {
 		return false, true, false, 0
 	}
 	ip := releaseClientIP(r, g.cfg.TrustProxy)
-	now := g.now()
+	provided := bearerToken(r.Header.Get("Authorization"))
+	tokenValid := provided != "" && len(provided) == len(g.cfg.AdminToken) &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(g.cfg.AdminToken)) == 1
 
 	g.mu.Lock()
-	if entry, exists := g.adminFails[ip]; exists {
-		if now.Sub(entry.windowStart) < adminAuthWindow {
-			if entry.count >= adminAuthMaxFailures {
-				rem := int(adminAuthWindow.Seconds() - now.Sub(entry.windowStart).Seconds())
-				if rem < 1 {
-					rem = 1
-				}
-				g.mu.Unlock()
-				return false, false, true, rem
-			}
-		} else {
-			delete(g.adminFails, ip)
-		}
-	}
-	g.mu.Unlock()
+	defer g.mu.Unlock()
+	now := g.monotonicNowLocked()
 
-	provided := bearerToken(r.Header.Get("Authorization"))
-	if provided != "" && len(provided) == len(g.cfg.AdminToken) &&
-		subtle.ConstantTimeCompare([]byte(provided), []byte(g.cfg.AdminToken)) == 1 {
-		g.mu.Lock()
+	entry, exists := g.adminFails[ip]
+	if exists && now.Sub(entry.windowStart) >= adminAuthWindow {
 		delete(g.adminFails, ip)
-		g.mu.Unlock()
+		exists = false
+	}
+	if exists && entry.count >= adminAuthMaxFailures {
+		return false, false, true, ceilRetrySeconds(adminAuthWindow - now.Sub(entry.windowStart))
+	}
+	if tokenValid {
+		delete(g.adminFails, ip)
 		return true, false, false, 0
 	}
 
-	g.mu.Lock()
-	if len(g.adminFails) >= guardMapMaxEntries {
+	if !exists && len(g.adminFails) >= guardMapMaxEntries {
 		for k, v := range g.adminFails {
 			if now.Sub(v.windowStart) >= adminAuthWindow {
 				delete(g.adminFails, k)
 			}
 		}
-	}
-	if len(g.adminFails) < guardMapMaxEntries {
-		entry := g.adminFails[ip]
-		if entry.windowStart.IsZero() || now.Sub(entry.windowStart) >= adminAuthWindow {
-			entry = windowCounter{windowStart: now, count: 1}
-		} else {
-			entry.count++
+		if len(g.adminFails) >= guardMapMaxEntries {
+			// 表满时对未跟踪失败来源直接返回 429 防绕过。
+			return false, false, true, 60
 		}
-		g.adminFails[ip] = entry
 	}
-	g.mu.Unlock()
+	if !exists {
+		entry = windowCounter{windowStart: now, count: 1}
+	} else {
+		entry.count++
+	}
+	g.adminFails[ip] = entry
+	if entry.count >= adminAuthMaxFailures {
+		return false, false, true, ceilRetrySeconds(adminAuthWindow - now.Sub(entry.windowStart))
+	}
 	return false, false, false, 0
 }
 
 func (g *releaseGuard) allowFileDownload(ip string, archiveBytes int64) (downloadDecision, int) {
-	now := g.now()
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	now := g.monotonicNowLocked()
 
 	// 1. 单 IP 10 分钟内高频拉包限制。
 	entry, exists := g.ipDownloads[ip]
 	if exists && now.Sub(entry.windowStart) < fileDownloadWindow {
 		if entry.count >= fileDownloadMaxPerIP {
-			rem := int(fileDownloadWindow.Seconds() - now.Sub(entry.windowStart).Seconds())
-			if rem < 1 {
-				rem = 1
-			}
-			return downloadDenyRateLimited, rem
+			return downloadDenyRateLimited, ceilRetrySeconds(fileDownloadWindow - now.Sub(entry.windowStart))
 		}
 	} else {
 		entry = windowCounter{windowStart: now, count: 0}
+		exists = false
 	}
 	if !exists && len(g.ipDownloads) >= guardMapMaxEntries {
 		for k, v := range g.ipDownloads {
@@ -151,20 +166,14 @@ func (g *releaseGuard) allowFileDownload(ip string, archiveBytes int64) (downloa
 		}
 	}
 
-	// 2. 滚动 1 小时 / 24 小时归档流量预算熔断检查。
+	// 2. 滚动 1 小时 / 24 小时归档流量预算检查（保守多保留 1 个边界分钟桶）。
 	curMin := now.Unix() / 60
-	hourlyUsed, dailyUsed, oldestHourMin, oldestDayMin := g.trafficTotalsLocked(curMin)
-	if hourlyUsed+archiveBytes > g.cfg.HourlyBudgetBytes {
-		retry := int((oldestHourMin + budgetHourMinutes - curMin) * 60)
-		if retry < 60 {
-			retry = 60
-		}
-		return downloadDenyBudgetExceeded, retry
-	}
-	if dailyUsed+archiveBytes > g.cfg.DailyBudgetBytes {
-		retry := int((oldestDayMin + budgetBucketMinutes - curMin) * 60)
-		if retry < 60 {
-			retry = 60
+	hourRetry := g.windowWaitSecondsLocked(curMin, budgetHourMinutes, g.cfg.HourlyBudgetBytes, archiveBytes)
+	dayRetry := g.windowWaitSecondsLocked(curMin, budgetDayMinutes, g.cfg.DailyBudgetBytes, archiveBytes)
+	if hourRetry > 0 || dayRetry > 0 {
+		retry := hourRetry
+		if dayRetry > retry {
+			retry = dayRetry
 		}
 		return downloadDenyBudgetExceeded, retry
 	}
@@ -172,9 +181,9 @@ func (g *releaseGuard) allowFileDownload(ip string, archiveBytes int64) (downloa
 	// 3. 放行记账。
 	entry.count++
 	g.ipDownloads[ip] = entry
-	idx := int(curMin % budgetBucketMinutes)
+	idx := int(curMin % budgetBucketSlots)
 	if idx < 0 {
-		idx += budgetBucketMinutes
+		idx += budgetBucketSlots
 	}
 	if g.buckets[idx].minute != curMin {
 		g.buckets[idx] = minuteTrafficBucket{minute: curMin, bytes: archiveBytes}
@@ -184,34 +193,59 @@ func (g *releaseGuard) allowFileDownload(ip string, archiveBytes int64) (downloa
 	return downloadAllowed, 0
 }
 
-func (g *releaseGuard) trafficTotalsLocked(curMin int64) (hourlyUsed, dailyUsed, oldestHourMin, oldestDayMin int64) {
-	hourStart := curMin - budgetHourMinutes + 1
-	dayStart := curMin - budgetBucketMinutes + 1
-	oldestHourMin = curMin
-	oldestDayMin = curMin
+// windowWaitSecondsLocked 计算在窗口内为 archiveBytes 腾出足够余额所需等待的保守秒数；0 表示可立即放行。
+func (g *releaseGuard) windowWaitSecondsLocked(curMin int64, windowMins int64, limit int64, need int64) int {
+	minMinute := curMin - windowMins // 含边界分钟，确保满整 windowMins 才退出窗口
+	var used int64
+	active := make([]minuteTrafficBucket, 0, 16)
+	for i := range g.buckets {
+		b := g.buckets[i]
+		if b.bytes <= 0 || b.minute < minMinute || b.minute > curMin {
+			continue
+		}
+		used += b.bytes
+		active = append(active, b)
+	}
+	if used+need <= limit {
+		return 0
+	}
+	sort.Slice(active, func(i, j int) bool { return active[i].minute < active[j].minute })
+	deficit := used + need - limit
+	var freed int64
+	for _, b := range active {
+		freed += b.bytes
+		if freed >= deficit {
+			expireMin := b.minute + windowMins + 1
+			waitSec := int((expireMin - curMin) * 60)
+			if waitSec < 60 {
+				waitSec = 60
+			}
+			return waitSec
+		}
+	}
+	return int(windowMins * 60)
+}
+
+func (g *releaseGuard) trafficTotalsLocked(curMin int64) (hourlyUsed, dailyUsed int64) {
+	hourStart := curMin - budgetHourMinutes
+	dayStart := curMin - budgetDayMinutes
 	for i := range g.buckets {
 		b := g.buckets[i]
 		if b.bytes <= 0 || b.minute < dayStart || b.minute > curMin {
 			continue
 		}
 		dailyUsed += b.bytes
-		if b.minute < oldestDayMin {
-			oldestDayMin = b.minute
-		}
 		if b.minute >= hourStart {
 			hourlyUsed += b.bytes
-			if b.minute < oldestHourMin {
-				oldestHourMin = b.minute
-			}
 		}
 	}
 	return
 }
 
 func (g *releaseGuard) budgetStatus() map[string]any {
-	curMin := g.now().Unix() / 60
 	g.mu.Lock()
-	hourlyUsed, dailyUsed, _, _ := g.trafficTotalsLocked(curMin)
+	curMin := g.monotonicNowLocked().Unix() / 60
+	hourlyUsed, dailyUsed := g.trafficTotalsLocked(curMin)
 	g.mu.Unlock()
 	tripped := hourlyUsed >= g.cfg.HourlyBudgetBytes || dailyUsed >= g.cfg.DailyBudgetBytes
 	return map[string]any{
@@ -224,9 +258,9 @@ func (g *releaseGuard) budgetStatus() map[string]any {
 }
 
 func (g *releaseGuard) isBudgetTripped() bool {
-	curMin := g.now().Unix() / 60
 	g.mu.Lock()
-	hourlyUsed, dailyUsed, _, _ := g.trafficTotalsLocked(curMin)
+	curMin := g.monotonicNowLocked().Unix() / 60
+	hourlyUsed, dailyUsed := g.trafficTotalsLocked(curMin)
 	g.mu.Unlock()
 	return hourlyUsed >= g.cfg.HourlyBudgetBytes || dailyUsed >= g.cfg.DailyBudgetBytes
 }

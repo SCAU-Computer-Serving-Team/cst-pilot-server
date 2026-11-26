@@ -132,7 +132,7 @@ func validateReleaseConfig(cfg releaseConfig) error {
 		return fmt.Errorf("RELEASE_ADMIN_TOKEN must be at least %d bytes", minReleaseAdminTokenBytes)
 	}
 	if cfg.AccelPrefix != "" {
-		if !strings.HasPrefix(cfg.AccelPrefix, "/") || strings.Contains(cfg.AccelPrefix, "..") || strings.ContainsAny(cfg.AccelPrefix, "\r\n\\") {
+		if !strings.HasPrefix(cfg.AccelPrefix, "/") || strings.Contains(cfg.AccelPrefix, "..") || strings.ContainsAny(cfg.AccelPrefix, "\r\n\\?#") {
 			return fmt.Errorf("invalid RELEASE_ACCEL_PREFIX")
 		}
 	}
@@ -158,26 +158,37 @@ func validateReleasePublicBaseURL(raw string) error {
 	if raw == "" {
 		return fmt.Errorf("must be configured")
 	}
+	if strings.ContainsAny(raw, "?#") {
+		return fmt.Errorf("base URL must not contain query or fragment delimiters")
+	}
 	u, err := validateReleaseHTTPSURL(raw)
 	if err != nil {
 		return err
 	}
-	if u.RawQuery != "" {
-		return fmt.Errorf("base URL must not contain query parameters")
+	if u.ForceQuery || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("base URL must not contain query or fragment")
 	}
 	return nil
 }
 
-func parseStrictReleasePublicKey(encoded string) (ed25519.PublicKey, error) {
-	if encoded == "" {
-		return nil, fmt.Errorf("empty public key")
-	}
-	if len(encoded) > 128 {
-		return nil, fmt.Errorf("public key too long")
+func decodeCanonicalStdBase64(encoded string) ([]byte, error) {
+	if encoded == "" || len(encoded) > 128 {
+		return nil, fmt.Errorf("invalid base64 length")
 	}
 	raw, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
 		return nil, fmt.Errorf("invalid base64 encoding")
+	}
+	if base64.StdEncoding.EncodeToString(raw) != encoded {
+		return nil, fmt.Errorf("non-canonical base64 encoding")
+	}
+	return raw, nil
+}
+
+func parseStrictReleasePublicKey(encoded string) (ed25519.PublicKey, error) {
+	raw, err := decodeCanonicalStdBase64(encoded)
+	if err != nil {
+		return nil, err
 	}
 	if len(raw) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("public key must be 32 bytes")
@@ -227,6 +238,9 @@ func parseEnvUint64(name string) (uint64, bool, error) {
 
 // validateReleaseHTTPSURL 对齐 cst-updater::manifest::validate_release_url。
 func validateReleaseHTTPSURL(raw string) (*url.URL, error) {
+	if strings.Contains(raw, "#") {
+		return nil, fmt.Errorf("fragment disallowed in release url")
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("invalid url")

@@ -6,10 +6,10 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/sha512"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -20,23 +20,28 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
 
 const (
-	maxManifestBytes      = 8 * 1024 * 1024
-	maxClientArchiveBytes = int64(2) << 30
-	maxClientUnpacked     = uint64(8) << 30
-	maxReleaseFiles       = 100_000
-	maxReleaseNotesBytes  = 16 * 1024
-	maxSha256SumsBytes    = 6 * 1024 * 1024
-	maxCentralDirBytes    = uint64(64) << 20
-	maxJSONDepth          = 64
+	maxManifestBytes          = 8 * 1024 * 1024
+	maxClientArchiveBytes     = int64(2) << 30
+	maxClientUnpacked         = uint64(8) << 30
+	maxReleaseFiles           = 100_000
+	maxReleaseNotesBytes      = 16 * 1024
+	maxSha256SumsBytes        = 6 * 1024 * 1024
+	maxCentralDirBytes        = uint64(64) << 20
+	maxServerCentralDirBudget = uint64(8) << 20  // 保护 48MiB 堆内存的中央目录解析预算
+	maxFontFileBytes          = uint64(32) << 20 // 对齐 cst-updater/layout.rs 32MiB 字体读取上限
+	maxSFNTDirectoryBytes     = 1 << 20          // 1MiB 表目录上限
+	maxJSONDepth              = 64
 
 	manifestDomain = "cst-pilot-release-manifest-v1\n"
 	sumsDomain     = "cst-pilot-release-sums-v1\n"
@@ -49,7 +54,7 @@ const (
 
 var (
 	releaseVersionPattern = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$`)
-	secretScanPattern     = regexp.MustCompile(`\b(?:sk-(?:proj-|ant-api[0-9]+-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16})|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----`)
+	secretScanPattern     = regexp.MustCompile(`\b(?:sk-(?:proj-|ant-api[0-9]+-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AIza[0-9A-Za-z_-]{30,}|AKIA[0-9A-Z]{16})|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|-----BEGIN (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----`)
 )
 
 var requiredReleaseBaseFiles = []string{
@@ -152,6 +157,7 @@ type releaseArchiveMeta struct {
 type verifiedReleaseManifest struct {
 	Info           releaseManifest
 	Sums           map[string]string
+	SortedPaths    []string
 	Envelope       []byte
 	ManifestSHA256 string
 	Filename       string
@@ -185,24 +191,15 @@ func verifyReleaseManifestEnvelope(envelope []byte, pubKey ed25519.PublicKey, pu
 	if len(envelope) == 0 || len(envelope) > maxManifestBytes {
 		return nil, fmt.Errorf("manifest exceeds size limits")
 	}
-	if err := validateStrictJSON(envelope); err != nil {
-		return nil, fmt.Errorf("manifest JSON invalid: %w", err)
-	}
-	var signed signedManifestEnvelope
-	if err := decodeStrictJSONStruct(envelope, &signed); err != nil {
+	signed, err := parseStrictSignedManifestEnvelope(envelope)
+	if err != nil {
 		return nil, fmt.Errorf("signed manifest format invalid: %w", err)
-	}
-	if signed.Payload == "" || signed.Signature == "" {
-		return nil, fmt.Errorf("signed manifest missing payload or signature")
 	}
 	if err := verifyStrictEd25519Domain(pubKey, manifestDomain, []byte(signed.Payload), signed.Signature); err != nil {
 		return nil, fmt.Errorf("manifest signature verification failed: %w", err)
 	}
-	if err := validateStrictJSON([]byte(signed.Payload)); err != nil {
-		return nil, fmt.Errorf("manifest payload JSON invalid: %w", err)
-	}
-	var info releaseManifest
-	if err := decodeStrictJSONStruct([]byte(signed.Payload), &info); err != nil {
+	info, err := parseStrictReleaseManifest([]byte(signed.Payload))
+	if err != nil {
 		return nil, fmt.Errorf("manifest payload fields invalid: %w", err)
 	}
 	if info.SchemaVersion != 1 || info.Platform != "windows-x86_64" {
@@ -211,8 +208,11 @@ func verifyReleaseManifestEnvelope(envelope []byte, pubKey ed25519.PublicKey, pu
 	if len(info.ReleaseNotes) > maxReleaseNotesBytes || len(info.SHA256Sums) > maxSha256SumsBytes {
 		return nil, fmt.Errorf("releaseNotes or sha256Sums exceeds size limit")
 	}
-	if info.Archive.Size == 0 || info.Archive.Size > uint64(maxClientArchiveBytes) || (maxArchiveBytes > 0 && info.Archive.Size > uint64(maxArchiveBytes)) {
-		return nil, fmt.Errorf("archive size exceeds allowed limit")
+	if info.Archive.Size == 0 || info.Archive.Size > uint64(maxClientArchiveBytes) {
+		return nil, fmt.Errorf("archive size exceeds protocol limit")
+	}
+	if maxArchiveBytes > 0 && info.Archive.Size > uint64(maxArchiveBytes) {
+		return nil, wrapReleaseErr(errArchiveTooLarge, "archive size %d exceeds configured limit %d", info.Archive.Size, maxArchiveBytes)
 	}
 	if info.Archive.UnpackedSize == 0 || info.Archive.UnpackedSize > maxClientUnpacked {
 		return nil, fmt.Errorf("archive unpackedSize out of range")
@@ -247,7 +247,7 @@ func verifyReleaseManifestEnvelope(envelope []byte, pubKey ed25519.PublicKey, pu
 	if err := verifyStrictEd25519Domain(pubKey, sumsDomain, []byte(info.SHA256Sums), info.SHA256Signature); err != nil {
 		return nil, fmt.Errorf("sha256Sums signature verification failed: %w", err)
 	}
-	sums, err := parseReleaseSums(info.SHA256Sums)
+	sums, sortedPaths, err := parseReleaseSums(info.SHA256Sums)
 	if err != nil {
 		return nil, err
 	}
@@ -259,6 +259,7 @@ func verifyReleaseManifestEnvelope(envelope []byte, pubKey ed25519.PublicKey, pu
 	return &verifiedReleaseManifest{
 		Info:           info,
 		Sums:           sums,
+		SortedPaths:    sortedPaths,
 		Envelope:       envCopy,
 		ManifestSHA256: hex.EncodeToString(digest[:]),
 		Filename:       expectedReleaseArchiveFilename(info.Version),
@@ -300,56 +301,69 @@ func checkRequiredManifestPaths(sums map[string]string) error {
 	return nil
 }
 
-// verifyReleaseArchiveStreaming 直接基于临时磁盘文件做流式 ZIP 全树校验，不解压落盘。
-func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *verifiedReleaseManifest) error {
+func hasSignedDirPrefix(sortedPaths []string, dir string) bool {
+	prefix := dir + "/"
+	idx := sort.SearchStrings(sortedPaths, prefix)
+	return idx < len(sortedPaths) && strings.HasPrefix(sortedPaths[idx], prefix)
+}
+
+// verifyReleaseArchiveStreaming 直接基于临时磁盘文件做流式 ZIP 全树校验，不解压落盘，支持上下文取消。
+func verifyReleaseArchiveStreaming(ctx context.Context, file *os.File, archiveSize int64, manifest *verifiedReleaseManifest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if uint64(archiveSize) != manifest.Info.Archive.Size {
 		return fmt.Errorf("archive size mismatch")
 	}
-	if err := validateZipBounds(file, archiveSize); err != nil {
+	bounds, err := validateZipBoundsAndCentralDirectory(ctx, file, archiveSize)
+	if err != nil {
 		return err
 	}
-	zr, err := zip.NewReader(file, archiveSize)
+	section := io.NewSectionReader(file, 0, archiveSize)
+	zr, err := zip.NewReader(section, archiveSize)
 	if err != nil {
 		return fmt.Errorf("invalid zip archive: %w", err)
 	}
-	if len(zr.File) == 0 || len(zr.File) > maxReleaseFiles*2 {
-		return fmt.Errorf("zip entry count out of range")
-	}
-
-	dirPrefixes := make(map[string]bool)
-	for p := range manifest.Sums {
-		parts := strings.Split(p, "/")
-		prefix := ""
-		for i := 0; i < len(parts)-1; i++ {
-			if prefix != "" {
-				prefix += "/"
-			}
-			prefix += parts[i]
-			dirPrefixes[prefix] = true
-		}
+	if uint64(len(zr.File)) != bounds.entryCount || len(zr.File) == 0 || len(zr.File) > maxReleaseFiles*2 {
+		return fmt.Errorf("zip entry count mismatch or out of range")
 	}
 
 	seenLower := make(map[string]bool, len(zr.File))
-	spellings := make(map[string]string, len(zr.File)*2)
+	dirSpellings := make(map[string]string)
 	seenFiles := make(map[string]bool, len(manifest.Sums)+1)
 	var totalUnpacked uint64
 	var versionContent []byte
 	var buildInfoContent []byte
+	sawRootDir := false
 
 	bufPtr := releaseBufPool.Get().(*[]byte)
 	defer releaseBufPool.Put(bufPtr)
 	buf := *bufPtr
 
 	for _, f := range zr.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if f.NonUTF8 || !utf8.ValidString(f.Name) {
 			return fmt.Errorf("zip entry name must be valid UTF-8")
 		}
 		isDir := f.FileInfo().IsDir() || strings.HasSuffix(f.Name, "/")
+		// 所有条目（包括根目录 cst-pilot/）均先执行统一元数据检查。
+		if err := validateZipEntryMetadata(f, isDir); err != nil {
+			return err
+		}
 		raw := f.Name
 		if isDir {
 			raw = strings.TrimSuffix(raw, "/")
 		}
 		if raw == "cst-pilot" && isDir {
+			if sawRootDir || f.UncompressedSize64 != 0 {
+				return fmt.Errorf("duplicate or non-empty top directory cst-pilot/")
+			}
+			sawRootDir = true
 			continue
 		}
 		if !strings.HasPrefix(raw, "cst-pilot/") {
@@ -364,18 +378,26 @@ func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *v
 			return fmt.Errorf("duplicate or case-conflicting zip entry: %s", rel)
 		}
 		seenLower[lowerRel] = true
-		if err := checkPathSpelling(rel, spellings); err != nil {
-			return err
-		}
-		if err := validateZipEntryMetadata(f, isDir); err != nil {
+		if err := checkDirectorySpelling(rel, isDir, dirSpellings); err != nil {
 			return err
 		}
 		if isDir {
 			if err := rejectRetiredReleasePath(rel); err != nil {
 				return err
 			}
-			if f.UncompressedSize64 != 0 || !dirPrefixes[rel] {
+			if f.UncompressedSize64 != 0 || !hasSignedDirPrefix(manifest.SortedPaths, rel) {
 				return fmt.Errorf("zip directory not allowed by signed sums: %s", rel)
+			}
+			// 验证目录条目可正常打开且内容为空（与客户端 by_index 一致）。
+			rc, err := f.Open()
+			if err != nil {
+				return fmt.Errorf("cannot open zip directory entry %s: %w", rel, err)
+			}
+			var probe [1]byte
+			n, rerr := rc.Read(probe[:])
+			cerr := rc.Close()
+			if n != 0 || (rerr != nil && rerr != io.EOF) || cerr != nil {
+				return fmt.Errorf("zip directory entry has unexpected payload: %s", rel)
 			}
 			continue
 		}
@@ -391,6 +413,9 @@ func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *v
 		if isSumsFile {
 			entryLimit = uint64(len(manifest.Info.SHA256Sums))
 		}
+		if _, isFont := requiredReleaseSFNTFonts[rel]; isFont && entryLimit > maxFontFileBytes {
+			entryLimit = maxFontFileBytes
+		}
 		if f.UncompressedSize64 > entryLimit {
 			return fmt.Errorf("zip file exceeds size limit: %s", rel)
 		}
@@ -402,7 +427,7 @@ func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *v
 		if err != nil {
 			return fmt.Errorf("cannot open zip entry %s: %w", rel, err)
 		}
-		readBytes, actualHash, headBuf, jsonBytes, scanErr := streamVerifyZipEntry(rc, rel, entryLimit, buf)
+		readBytes, actualHash, fontDirBuf, capturedBytes, scanErr := streamVerifyZipEntry(ctx, rc, rel, entryLimit, buf)
 		closeErr := rc.Close()
 		if scanErr != nil {
 			return scanErr
@@ -416,7 +441,7 @@ func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *v
 		totalUnpacked += readBytes
 
 		if isSumsFile {
-			if !bytes.Equal(jsonBytes, []byte(manifest.Info.SHA256Sums)) {
+			if !bytes.Equal(capturedBytes, []byte(manifest.Info.SHA256Sums)) {
 				return fmt.Errorf("archive app/SHA256SUMS does not match signed manifest")
 			}
 		} else {
@@ -424,14 +449,14 @@ func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *v
 				return fmt.Errorf("archive file sha256 mismatch: %s", rel)
 			}
 			if magic, ok := requiredReleaseSFNTFonts[rel]; ok {
-				if err := validateSFNTHeader(headBuf, readBytes, magic); err != nil {
+				if err := validateSFNTHeader(fontDirBuf, readBytes, magic); err != nil {
 					return fmt.Errorf("invalid font %s: %w", rel, err)
 				}
 			}
 			if rel == "VERSION" {
-				versionContent = jsonBytes
+				versionContent = capturedBytes
 			} else if rel == releaseBuildInfoPath {
-				buildInfoContent = jsonBytes
+				buildInfoContent = capturedBytes
 			}
 		}
 		seenFiles[rel] = true
@@ -454,9 +479,9 @@ func verifyReleaseArchiveStreaming(file *os.File, archiveSize int64, manifest *v
 	return nil
 }
 
-func streamVerifyZipEntry(rc io.Reader, rel string, limit uint64, buf []byte) (uint64, string, []byte, []byte, error) {
+func streamVerifyZipEntry(ctx context.Context, rc io.Reader, rel string, limit uint64, buf []byte) (uint64, string, []byte, []byte, error) {
 	isSums := rel == releaseSHA256SumsPath
-	isJSON := strings.HasSuffix(rel, ".json")
+	isJSON := strings.HasSuffix(strings.ToLower(rel), ".json")
 	isVersion := rel == "VERSION"
 	_, isFont := requiredReleaseSFNTFonts[rel]
 
@@ -474,13 +499,16 @@ func streamVerifyZipEntry(rc io.Reader, rel string, limit uint64, buf []byte) (u
 	}
 
 	var fontHead []byte
-	const maxFontHeaderBytes = 12 + 256*16
+	fontDirNeed := 12 // 先读 12 字节取得 numTables，再精确扩展到 12 + numTables*16
 
 	hasher := sha256.New()
 	var readTotal uint64
 	var secretTail []byte
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, "", nil, nil, err
+		}
 		n, err := rc.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
@@ -505,12 +533,27 @@ func streamVerifyZipEntry(rc io.Reader, rel string, limit uint64, buf []byte) (u
 				}
 				capture = append(capture, chunk...)
 			}
-			if isFont && len(fontHead) < maxFontHeaderBytes {
-				need := maxFontHeaderBytes - len(fontHead)
-				if need > n {
-					need = n
+			if isFont && len(fontHead) < fontDirNeed {
+				take := fontDirNeed - len(fontHead)
+				if take > n {
+					take = n
 				}
-				fontHead = append(fontHead, chunk[:need]...)
+				fontHead = append(fontHead, chunk[:take]...)
+				if fontDirNeed == 12 && len(fontHead) == 12 {
+					numTables := int(binary.BigEndian.Uint16(fontHead[4:6]))
+					dirEnd := 12 + numTables*16
+					if dirEnd > maxSFNTDirectoryBytes {
+						return 0, "", nil, nil, fmt.Errorf("font table directory exceeds limit: %s", rel)
+					}
+					fontDirNeed = dirEnd
+					if take < n && len(fontHead) < fontDirNeed {
+						more := fontDirNeed - len(fontHead)
+						if more > n-take {
+							more = n - take
+						}
+						fontHead = append(fontHead, chunk[take:take+more]...)
+					}
+				}
 			}
 		}
 		if err == io.EOF {
@@ -562,8 +605,8 @@ func validateArchiveMetadataFiles(versionBytes, buildInfoBytes []byte, expectedV
 }
 
 func validateSFNTHeader(head []byte, totalLen uint64, expectedMagic [4]byte) error {
-	if len(head) < 28 || totalLen < 28 {
-		return fmt.Errorf("font header truncated")
+	if len(head) < 28 || totalLen < 28 || totalLen > maxFontFileBytes {
+		return fmt.Errorf("font header truncated or exceeds 32 MiB")
 	}
 	if [4]byte(head[:4]) != expectedMagic {
 		return fmt.Errorf("font magic mismatch")
@@ -597,6 +640,9 @@ func validateSFNTHeader(head []byte, totalLen uint64, expectedMagic [4]byte) err
 func validateZipEntryMetadata(f *zip.File, isDir bool) error {
 	if f.Flags&0x1 != 0 {
 		return fmt.Errorf("encrypted zip entry rejected: %s", f.Name)
+	}
+	if f.Method != zip.Store && f.Method != zip.Deflate {
+		return fmt.Errorf("unsupported zip compression method %d: %s", f.Method, f.Name)
 	}
 	if f.Mode()&fs.ModeSymlink != 0 {
 		return fmt.Errorf("symlink zip entry rejected: %s", f.Name)
@@ -632,10 +678,18 @@ func checkZipExtraFields(extra []byte) error {
 	return nil
 }
 
-// validateZipBounds 对齐 crates/cst-updater/src/verify.rs::zip_bounds。
-func validateZipBounds(file *os.File, fileLen int64) error {
+type zipBoundsInfo struct {
+	entryCount uint64
+	cdSize     uint64
+	cdOffset   uint64
+	eocdPos    uint64
+}
+
+// validateZipBoundsAndCentralDirectory 单次定位 EOCD/ZIP64 并流式扫描中央目录及本地头一致性，
+// 防止 archive/zip 脱离 cdSize 无限分配撑爆 48 MiB 堆内存。
+func validateZipBoundsAndCentralDirectory(ctx context.Context, file *os.File, fileLen int64) (zipBoundsInfo, error) {
 	if fileLen < 22 {
-		return fmt.Errorf("zip archive too small")
+		return zipBoundsInfo{}, fmt.Errorf("zip archive too small")
 	}
 	start := fileLen - 65557
 	if start < 0 {
@@ -644,7 +698,7 @@ func validateZipBounds(file *os.File, fileLen int64) error {
 	tailLen := int(fileLen - start)
 	tail := make([]byte, tailLen)
 	if _, err := file.ReadAt(tail, start); err != nil {
-		return fmt.Errorf("cannot read zip tail: %w", err)
+		return zipBoundsInfo{}, fmt.Errorf("cannot read zip tail: %w", err)
 	}
 	at := -1
 	for i := tailLen - 22; i >= 0; i-- {
@@ -657,11 +711,11 @@ func validateZipBounds(file *os.File, fileLen int64) error {
 		}
 	}
 	if at < 0 {
-		return fmt.Errorf("missing zip EOCD")
+		return zipBoundsInfo{}, fmt.Errorf("missing zip EOCD")
 	}
 	eocd := tail[at:]
 	if !bytes.Equal(eocd[4:8], []byte{0, 0, 0, 0}) || !bytes.Equal(eocd[8:10], eocd[10:12]) {
-		return fmt.Errorf("multi-disk zip rejected")
+		return zipBoundsInfo{}, fmt.Errorf("multi-disk zip rejected")
 	}
 	count := uint64(binary.LittleEndian.Uint16(eocd[10:12]))
 	cdSize := uint64(binary.LittleEndian.Uint32(eocd[12:16]))
@@ -670,42 +724,129 @@ func validateZipBounds(file *os.File, fileLen int64) error {
 
 	if count == 0xffff || cdSize == 0xffff_ffff || cdOffset == 0xffff_ffff {
 		if at < 20 {
-			return fmt.Errorf("missing zip64 locator")
+			return zipBoundsInfo{}, fmt.Errorf("missing zip64 locator")
 		}
 		locator := tail[at-20 : at]
 		if !bytes.Equal(locator[:8], []byte{'P', 'K', 0x06, 0x07, 0, 0, 0, 0}) ||
 			!bytes.Equal(locator[16:20], []byte{1, 0, 0, 0}) {
-			return fmt.Errorf("invalid zip64 locator")
+			return zipBoundsInfo{}, fmt.Errorf("invalid zip64 locator")
 		}
 		pos := binary.LittleEndian.Uint64(locator[8:16])
 		if pos+56 < pos || pos+56 > eocdPos-20 {
-			return fmt.Errorf("invalid zip64 offset")
+			return zipBoundsInfo{}, fmt.Errorf("invalid zip64 offset")
 		}
 		var z64 [56]byte
 		if _, err := file.ReadAt(z64[:], int64(pos)); err != nil {
-			return fmt.Errorf("cannot read zip64 EOCD")
+			return zipBoundsInfo{}, fmt.Errorf("cannot read zip64 EOCD")
 		}
 		if !bytes.Equal(z64[:4], []byte{'P', 'K', 0x06, 0x06}) ||
 			!bytes.Equal(z64[16:24], make([]byte, 8)) ||
 			!bytes.Equal(z64[24:32], z64[32:40]) {
-			return fmt.Errorf("invalid zip64 EOCD")
+			return zipBoundsInfo{}, fmt.Errorf("invalid zip64 EOCD")
 		}
 		recordSize := binary.LittleEndian.Uint64(z64[4:12])
 		if recordSize < 44 || recordSize > 4096 || pos+12+recordSize != eocdPos-20 {
-			return fmt.Errorf("invalid zip64 record size")
+			return zipBoundsInfo{}, fmt.Errorf("invalid zip64 record size")
 		}
 		count = binary.LittleEndian.Uint64(z64[32:40])
 		cdSize = binary.LittleEndian.Uint64(z64[40:48])
 		cdOffset = binary.LittleEndian.Uint64(z64[48:56])
 	}
 	if count == 0 || count > uint64(maxReleaseFiles*2) || cdSize > maxCentralDirBytes ||
-		cdOffset+cdSize < cdOffset || cdOffset+cdSize > eocdPos {
-		return fmt.Errorf("zip central directory bounds exceeded")
+		cdSize > maxServerCentralDirBudget || cdOffset+cdSize < cdOffset || cdOffset+cdSize > eocdPos {
+		return zipBoundsInfo{}, fmt.Errorf("zip central directory bounds exceeded")
 	}
-	return nil
+
+	// 流式逐条校验中央目录，确保计数、区间、单盘与本地头完全一致。
+	cdReader := io.NewSectionReader(file, int64(cdOffset), int64(cdSize))
+	var consumed uint64
+	var actualCount uint64
+	var hdr [46]byte
+	var localHdr [30]byte
+	for consumed < cdSize {
+		if err := ctx.Err(); err != nil {
+			return zipBoundsInfo{}, err
+		}
+		if _, err := io.ReadFull(cdReader, hdr[:]); err != nil {
+			return zipBoundsInfo{}, fmt.Errorf("truncated central directory header")
+		}
+		if !bytes.Equal(hdr[0:4], []byte{'P', 'K', 0x01, 0x02}) {
+			return zipBoundsInfo{}, fmt.Errorf("invalid central directory entry signature")
+		}
+		flags := binary.LittleEndian.Uint16(hdr[8:10])
+		method := binary.LittleEndian.Uint16(hdr[10:12])
+		nameLen := uint64(binary.LittleEndian.Uint16(hdr[28:30]))
+		extraLen := uint64(binary.LittleEndian.Uint16(hdr[30:32]))
+		commentLen := uint64(binary.LittleEndian.Uint16(hdr[32:34]))
+		diskStart := binary.LittleEndian.Uint16(hdr[34:36])
+		localOff := uint64(binary.LittleEndian.Uint32(hdr[42:46]))
+
+		if diskStart != 0 || nameLen == 0 || nameLen > 512 || extraLen > 1024 || commentLen > 1024 {
+			return zipBoundsInfo{}, fmt.Errorf("central directory entry metadata out of bounds")
+		}
+		if flags&0x1 != 0 || (method != zip.Store && method != zip.Deflate) {
+			return zipBoundsInfo{}, fmt.Errorf("central directory entry encrypted or unsupported method")
+		}
+		varLen := nameLen + extraLen + commentLen
+		if consumed+46+varLen > cdSize {
+			return zipBoundsInfo{}, fmt.Errorf("central directory entry overflows cdSize")
+		}
+		varBuf := make([]byte, varLen)
+		if _, err := io.ReadFull(cdReader, varBuf); err != nil {
+			return zipBoundsInfo{}, fmt.Errorf("truncated central directory variable fields")
+		}
+		cdName := varBuf[:nameLen]
+		cdExtra := varBuf[nameLen : nameLen+extraLen]
+		if err := checkZipExtraFields(cdExtra); err != nil {
+			return zipBoundsInfo{}, err
+		}
+
+		// 若非 ZIP64 扩展偏移，立即核对本地文件头元数据一致性。
+		if localOff != 0xffff_ffff {
+			if localOff+30 > cdOffset {
+				return zipBoundsInfo{}, fmt.Errorf("local file header offset out of bounds")
+			}
+			if _, err := file.ReadAt(localHdr[:], int64(localOff)); err != nil {
+				return zipBoundsInfo{}, fmt.Errorf("cannot read local file header")
+			}
+			if !bytes.Equal(localHdr[0:4], []byte{'P', 'K', 0x03, 0x04}) {
+				return zipBoundsInfo{}, fmt.Errorf("invalid local file header signature")
+			}
+			lFlags := binary.LittleEndian.Uint16(localHdr[6:8])
+			lMethod := binary.LittleEndian.Uint16(localHdr[8:10])
+			lNameLen := uint64(binary.LittleEndian.Uint16(localHdr[26:28]))
+			lExtraLen := uint64(binary.LittleEndian.Uint16(localHdr[28:30]))
+			if lFlags&0x1 != 0 || lMethod != method || lNameLen != nameLen || lExtraLen > 1024 {
+				return zipBoundsInfo{}, fmt.Errorf("local file header metadata mismatch")
+			}
+			if localOff+30+lNameLen+lExtraLen > cdOffset {
+				return zipBoundsInfo{}, fmt.Errorf("local file header variable fields out of bounds")
+			}
+			lVar := make([]byte, lNameLen+lExtraLen)
+			if _, err := file.ReadAt(lVar, int64(localOff+30)); err != nil {
+				return zipBoundsInfo{}, fmt.Errorf("cannot read local file header fields")
+			}
+			if !bytes.Equal(lVar[:lNameLen], cdName) {
+				return zipBoundsInfo{}, fmt.Errorf("local and central directory filenames differ")
+			}
+			if err := checkZipExtraFields(lVar[lNameLen:]); err != nil {
+				return zipBoundsInfo{}, fmt.Errorf("local header extra field invalid: %w", err)
+			}
+		}
+
+		consumed += 46 + varLen
+		actualCount++
+		if actualCount > count {
+			return zipBoundsInfo{}, fmt.Errorf("central directory entry count exceeds EOCD count")
+		}
+	}
+	if actualCount != count {
+		return zipBoundsInfo{}, fmt.Errorf("central directory entry count mismatch")
+	}
+	return zipBoundsInfo{entryCount: count, cdSize: cdSize, cdOffset: cdOffset, eocdPos: eocdPos}, nil
 }
 
-func parseReleaseSums(text string) (map[string]string, error) {
+func parseReleaseSums(text string) (map[string]string, []string, error) {
 	sums := make(map[string]string)
 	seenLower := make(map[string]bool)
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
@@ -715,38 +856,49 @@ func parseReleaseSums(text string) (map[string]string, error) {
 	for _, line := range lines {
 		hash, path, ok := strings.Cut(line, "  ")
 		if !ok || !isLowerHexSHA256(hash) || path == releaseSHA256SumsPath {
-			return nil, fmt.Errorf("invalid sha256Sums line format")
+			return nil, nil, fmt.Errorf("invalid sha256Sums line format")
 		}
 		if err := classifyReleaseProgramPath(path); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		lower := strings.ToLower(path)
 		if seenLower[lower] {
-			return nil, fmt.Errorf("duplicate or case-conflicting path in sha256Sums: %s", path)
+			return nil, nil, fmt.Errorf("duplicate or case-conflicting path in sha256Sums: %s", path)
 		}
 		seenLower[lower] = true
 		sums[path] = hash
 		if len(sums) > maxReleaseFiles {
-			return nil, fmt.Errorf("sha256Sums file count exceeds limit")
-		}
-	}
-	for p := range sums {
-		parts := strings.Split(p, "/")
-		prefix := ""
-		for i := 0; i < len(parts)-1; i++ {
-			if prefix != "" {
-				prefix += "/"
-			}
-			prefix += parts[i]
-			if seenLower[strings.ToLower(prefix)] {
-				return nil, fmt.Errorf("file/directory conflict in sha256Sums: %s", prefix)
-			}
+			return nil, nil, fmt.Errorf("sha256Sums file count exceeds limit")
 		}
 	}
 	if len(sums) == 0 {
-		return nil, fmt.Errorf("empty sha256Sums")
+		return nil, nil, fmt.Errorf("empty sha256Sums")
 	}
-	return sums, nil
+	sortedPaths := make([]string, 0, len(sums))
+	for p := range sums {
+		sortedPaths = append(sortedPaths, p)
+	}
+	sort.Strings(sortedPaths)
+
+	checkedDirs := make(map[string]bool)
+	for _, p := range sortedPaths {
+		for idx := strings.IndexByte(p, '/'); idx >= 0; {
+			dir := p[:idx]
+			lowerDir := strings.ToLower(dir)
+			if !checkedDirs[lowerDir] {
+				if seenLower[lowerDir] {
+					return nil, nil, fmt.Errorf("file/directory conflict in sha256Sums: %s", dir)
+				}
+				checkedDirs[lowerDir] = true
+			}
+			next := strings.IndexByte(p[idx+1:], '/')
+			if next < 0 {
+				break
+			}
+			idx += 1 + next
+		}
+	}
+	return sums, sortedPaths, nil
 }
 
 func validateSafeReleasePath(path string) error {
@@ -754,7 +906,7 @@ func validateSafeReleasePath(path string) error {
 		return fmt.Errorf("invalid release path")
 	}
 	for _, r := range path {
-		if r < 0x20 || r == 0x7f || strings.ContainsRune(":*?\"<>|", r) {
+		if unicode.IsControl(r) || strings.ContainsRune(":*?\"<>|", r) {
 			return fmt.Errorf("release path contains forbidden character")
 		}
 	}
@@ -825,18 +977,28 @@ func classifyReleaseProgramPath(path string) error {
 	return fmt.Errorf("release path outside program whitelist: %s", path)
 }
 
-func checkPathSpelling(path string, spellings map[string]string) error {
-	prefix := ""
-	for _, part := range strings.Split(path, "/") {
-		if prefix != "" {
-			prefix += "/"
+func checkDirectorySpelling(path string, isDir bool, dirSpellings map[string]string) error {
+	// 仅对目录前缀建立拼写表，避免为叶子文件复制完整路径字符串。
+	checkDir := func(dir string) error {
+		key := strings.ToLower(dir)
+		if old, exists := dirSpellings[key]; exists && old != dir {
+			return fmt.Errorf("case conflict on ancestor path: %s vs %s", old, dir)
 		}
-		prefix += part
-		key := strings.ToLower(prefix)
-		if old, exists := spellings[key]; exists && old != prefix {
-			return fmt.Errorf("case conflict on ancestor path: %s vs %s", old, prefix)
+		dirSpellings[key] = dir
+		return nil
+	}
+	for idx := strings.IndexByte(path, '/'); idx >= 0; {
+		if err := checkDir(path[:idx]); err != nil {
+			return err
 		}
-		spellings[key] = prefix
+		next := strings.IndexByte(path[idx+1:], '/')
+		if next < 0 {
+			break
+		}
+		idx += 1 + next
+	}
+	if isDir {
+		return checkDir(path)
 	}
 	return nil
 }
@@ -874,12 +1036,25 @@ func checkJSONNoSecrets(v any) error {
 				return err
 			}
 		}
+	case string:
+		if secretScanPattern.MatchString(node) {
+			return fmt.Errorf("contains credential pattern in JSON string")
+		}
 	}
 	return nil
 }
 
-// validateStrictJSON 拒绝重复键、尾随数据及过深嵌套。
+// -----------------------------------------------------------------------------
+// 严格 JSON 校验（对齐 Rust serde_json：UTF-8、无未配对代理项、无重复键、精确大小写键集合）
+// -----------------------------------------------------------------------------
+
 func validateStrictJSON(data []byte) error {
+	if !utf8.Valid(data) {
+		return fmt.Errorf("JSON must be valid UTF-8")
+	}
+	if err := validateNoUnpairedJSONSurrogates(data); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := walkStrictJSONToken(dec, 0); err != nil {
@@ -887,6 +1062,58 @@ func validateStrictJSON(data []byte) error {
 	}
 	if _, err := dec.Token(); err != io.EOF {
 		return fmt.Errorf("unexpected trailing JSON data")
+	}
+	return nil
+}
+
+func validateNoUnpairedJSONSurrogates(data []byte) error {
+	inString := false
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		if !inString {
+			if b == '"' {
+				inString = true
+			}
+			continue
+		}
+		if b == '"' {
+			inString = false
+			continue
+		}
+		if b != '\\' {
+			continue
+		}
+		i++
+		if i >= len(data) {
+			return fmt.Errorf("unterminated JSON escape")
+		}
+		if data[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(data) {
+			return fmt.Errorf("truncated unicode escape")
+		}
+		code, err := strconv.ParseUint(string(data[i+1:i+5]), 16, 16)
+		if err != nil {
+			return fmt.Errorf("invalid unicode escape")
+		}
+		i += 4
+		if code >= 0xDC00 && code <= 0xDFFF {
+			return fmt.Errorf("unpaired low UTF-16 surrogate")
+		}
+		if code >= 0xD800 && code <= 0xDBFF {
+			if i+6 >= len(data) || data[i+1] != '\\' || data[i+2] != 'u' {
+				return fmt.Errorf("unpaired high UTF-16 surrogate")
+			}
+			low, err := strconv.ParseUint(string(data[i+3:i+7]), 16, 16)
+			if err != nil || low < 0xDC00 || low > 0xDFFF {
+				return fmt.Errorf("invalid surrogate pair")
+			}
+			i += 6
+		}
+	}
+	if inString {
+		return fmt.Errorf("unterminated JSON string")
 	}
 	return nil
 }
@@ -943,20 +1170,174 @@ func walkStrictJSONToken(dec *json.Decoder, depth int) error {
 	return nil
 }
 
-func decodeStrictJSONStruct(data []byte, dst any) error {
+func parseStrictJSONObject(data []byte) (map[string]any, error) {
+	if err := validateStrictJSON(data); err != nil {
+		return nil, err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return err
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return nil, fmt.Errorf("expected JSON object")
 	}
 	if _, err := dec.Token(); err != io.EOF {
-		return fmt.Errorf("trailing JSON tokens")
+		return nil, fmt.Errorf("trailing JSON tokens")
+	}
+	return obj, nil
+}
+
+func requireExactKeys(obj map[string]any, allowed ...string) error {
+	if len(obj) != len(allowed) {
+		return fmt.Errorf("unexpected or missing JSON object keys")
+	}
+	for _, k := range allowed {
+		if _, ok := obj[k]; !ok {
+			return fmt.Errorf("missing required JSON field %q", k)
+		}
 	}
 	return nil
 }
 
+func requireJSONString(obj map[string]any, key string) (string, error) {
+	val, ok := obj[key]
+	if !ok {
+		return "", fmt.Errorf("missing %q", key)
+	}
+	s, ok := val.(string)
+	if !ok {
+		return "", fmt.Errorf("field %q must be string", key)
+	}
+	return s, nil
+}
+
+func requireJSONUint64(obj map[string]any, key string) (uint64, error) {
+	val, ok := obj[key]
+	if !ok {
+		return 0, fmt.Errorf("missing %q", key)
+	}
+	num, ok := val.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("field %q must be integer", key)
+	}
+	raw := num.String()
+	if strings.ContainsAny(raw, ".eE-+") {
+		return 0, fmt.Errorf("field %q must be unsigned integer", key)
+	}
+	v, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("field %q invalid uint64", key)
+	}
+	return v, nil
+}
+
+func parseStrictSignedManifestEnvelope(data []byte) (signedManifestEnvelope, error) {
+	obj, err := parseStrictJSONObject(data)
+	if err != nil {
+		return signedManifestEnvelope{}, err
+	}
+	if err := requireExactKeys(obj, "payload", "signature"); err != nil {
+		return signedManifestEnvelope{}, err
+	}
+	payload, err := requireJSONString(obj, "payload")
+	if err != nil {
+		return signedManifestEnvelope{}, err
+	}
+	sig, err := requireJSONString(obj, "signature")
+	if err != nil {
+		return signedManifestEnvelope{}, err
+	}
+	if payload == "" || sig == "" {
+		return signedManifestEnvelope{}, fmt.Errorf("payload and signature must be non-empty")
+	}
+	return signedManifestEnvelope{Payload: payload, Signature: sig}, nil
+}
+
+func parseStrictReleaseManifest(data []byte) (releaseManifest, error) {
+	obj, err := parseStrictJSONObject(data)
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	if err := requireExactKeys(obj,
+		"schemaVersion", "platform", "version", "builtAt", "minUpgradableVersion",
+		"releaseNotes", "archive", "sha256Sums", "sha256Signature",
+	); err != nil {
+		return releaseManifest{}, err
+	}
+	schemaVer, err := requireJSONUint64(obj, "schemaVersion")
+	if err != nil || schemaVer > 0xffffffff {
+		return releaseManifest{}, fmt.Errorf("invalid schemaVersion")
+	}
+	platform, err := requireJSONString(obj, "platform")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	version, err := requireJSONString(obj, "version")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	builtAt, err := requireJSONString(obj, "builtAt")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	minVer, err := requireJSONString(obj, "minUpgradableVersion")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	notes, err := requireJSONString(obj, "releaseNotes")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	sums, err := requireJSONString(obj, "sha256Sums")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	sumsSig, err := requireJSONString(obj, "sha256Signature")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	archObj, ok := obj["archive"].(map[string]any)
+	if !ok || archObj == nil {
+		return releaseManifest{}, fmt.Errorf("archive must be object")
+	}
+	if err := requireExactKeys(archObj, "url", "size", "unpackedSize", "sha256"); err != nil {
+		return releaseManifest{}, err
+	}
+	archURL, err := requireJSONString(archObj, "url")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	archSize, err := requireJSONUint64(archObj, "size")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	unpackedSize, err := requireJSONUint64(archObj, "unpackedSize")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	archSHA, err := requireJSONString(archObj, "sha256")
+	if err != nil {
+		return releaseManifest{}, err
+	}
+	return releaseManifest{
+		SchemaVersion:        uint32(schemaVer),
+		Platform:             platform,
+		Version:              version,
+		BuiltAt:              builtAt,
+		MinUpgradableVersion: minVer,
+		ReleaseNotes:         notes,
+		Archive: releaseArchiveMeta{
+			URL:          archURL,
+			Size:         archSize,
+			UnpackedSize: unpackedSize,
+			SHA256:       archSHA,
+		},
+		SHA256Sums:      sums,
+		SHA256Signature: sumsSig,
+	}, nil
+}
+
 // -----------------------------------------------------------------------------
-// SemVer 2.0 解析与比较（支持可选前导 v，对齐 Rust semver::Version）
+// SemVer 2.0 解析与比较（支持可选前导 v，对齐 Rust semver::Version Ord 语义）
 // -----------------------------------------------------------------------------
 
 type semverVersion struct {
@@ -964,6 +1345,32 @@ type semverVersion struct {
 	minor uint64
 	patch uint64
 	pre   []string
+	build []string
+}
+
+func isValidSemverIdent(id string) bool {
+	if id == "" {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func parseSemver(raw string) (semverVersion, error) {
@@ -971,9 +1378,17 @@ func parseSemver(raw string) (semverVersion, error) {
 		return semverVersion{}, fmt.Errorf("invalid semver")
 	}
 	s := strings.TrimPrefix(raw, "v")
+	var build []string
 	if idx := strings.IndexByte(s, '+'); idx >= 0 {
-		if idx == len(s)-1 {
+		buildStr := s[idx+1:]
+		if buildStr == "" {
 			return semverVersion{}, fmt.Errorf("empty build metadata")
+		}
+		build = strings.Split(buildStr, ".")
+		for _, id := range build {
+			if !isValidSemverIdent(id) {
+				return semverVersion{}, fmt.Errorf("invalid build metadata identifier")
+			}
 		}
 		s = s[:idx]
 	}
@@ -985,20 +1400,10 @@ func parseSemver(raw string) (semverVersion, error) {
 		}
 		pre = strings.Split(preStr, ".")
 		for _, id := range pre {
-			if id == "" {
-				return semverVersion{}, fmt.Errorf("empty prerelease identifier")
+			if !isValidSemverIdent(id) {
+				return semverVersion{}, fmt.Errorf("invalid prerelease identifier")
 			}
-			isNum := true
-			for i := 0; i < len(id); i++ {
-				c := id[i]
-				if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-') {
-					return semverVersion{}, fmt.Errorf("invalid prerelease char")
-				}
-				if c < '0' || c > '9' {
-					isNum = false
-				}
-			}
-			if isNum && len(id) > 1 && id[0] == '0' {
+			if isAllDigits(id) && len(id) > 1 && id[0] == '0' {
 				return semverVersion{}, fmt.Errorf("leading zero in numeric prerelease")
 			}
 		}
@@ -1019,7 +1424,63 @@ func parseSemver(raw string) (semverVersion, error) {
 		}
 		nums[i] = n
 	}
-	return semverVersion{major: nums[0], minor: nums[1], patch: nums[2], pre: pre}, nil
+	return semverVersion{major: nums[0], minor: nums[1], patch: nums[2], pre: pre, build: build}, nil
+}
+
+func compareNumericString(a, b string) int {
+	if len(a) != len(b) {
+		if len(a) < len(b) {
+			return -1
+		}
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
+func compareIdentList(a, b []string, emptyIsGreater bool) int {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	if len(a) == 0 {
+		if emptyIsGreater {
+			return 1
+		}
+		return -1
+	}
+	if len(b) == 0 {
+		if emptyIsGreater {
+			return -1
+		}
+		return 1
+	}
+	minLen := len(a)
+	if len(b) < minLen {
+		minLen = len(b)
+	}
+	for i := 0; i < minLen; i++ {
+		if a[i] == b[i] {
+			continue
+		}
+		aNum := isAllDigits(a[i])
+		bNum := isAllDigits(b[i])
+		switch {
+		case aNum && bNum:
+			return compareNumericString(a[i], b[i])
+		case aNum:
+			return -1
+		case bNum:
+			return 1
+		default:
+			return strings.Compare(a[i], b[i])
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
 }
 
 func compareSemver(a, b semverVersion) int {
@@ -1041,49 +1502,11 @@ func compareSemver(a, b semverVersion) int {
 		}
 		return 1
 	}
-	if len(a.pre) == 0 && len(b.pre) == 0 {
-		return 0
+	if cmp := compareIdentList(a.pre, b.pre, true); cmp != 0 {
+		return cmp
 	}
-	if len(a.pre) == 0 {
-		return 1
-	}
-	if len(b.pre) == 0 {
-		return -1
-	}
-	minLen := len(a.pre)
-	if len(b.pre) < minLen {
-		minLen = len(b.pre)
-	}
-	for i := 0; i < minLen; i++ {
-		if a.pre[i] == b.pre[i] {
-			continue
-		}
-		na, erra := strconv.ParseUint(a.pre[i], 10, 64)
-		nb, errb := strconv.ParseUint(b.pre[i], 10, 64)
-		switch {
-		case erra == nil && errb == nil:
-			if na < nb {
-				return -1
-			}
-			return 1
-		case erra == nil:
-			return -1
-		case errb == nil:
-			return 1
-		default:
-			if a.pre[i] < b.pre[i] {
-				return -1
-			}
-			return 1
-		}
-	}
-	if len(a.pre) < len(b.pre) {
-		return -1
-	}
-	if len(a.pre) > len(b.pre) {
-		return 1
-	}
-	return 0
+	// 对齐 Rust semver::Version::cmp（build metadata 参与 Ord 比较）。
+	return compareIdentList(a.build, b.build, false)
 }
 
 // -----------------------------------------------------------------------------
@@ -1182,7 +1605,6 @@ func decodeCanonicalEd25519Point(encoded []byte) (edPoint, error) {
 	copy(le[:], encoded)
 	signBit := (le[31] >> 7) & 1
 	le[31] &= 0x7f
-	// 小端转大端供 big.Int 解析。
 	var be [32]byte
 	for i := 0; i < 32; i++ {
 		be[i] = le[31-i]
@@ -1192,7 +1614,6 @@ func decodeCanonicalEd25519Point(encoded []byte) (edPoint, error) {
 		return edPoint{}, fmt.Errorf("non-canonical point y >= p")
 	}
 
-	// x^2 = (y^2 - 1) / (d*y^2 + 1) mod p
 	y2 := new(big.Int).Mod(new(big.Int).Mul(y, y), edP)
 	u := new(big.Int).Mod(new(big.Int).Sub(y2, big.NewInt(1)), edP)
 	v := new(big.Int).Mod(new(big.Int).Add(new(big.Int).Mul(edD, y2), big.NewInt(1)), edP)
@@ -1226,9 +1647,6 @@ func decodeCanonicalEd25519Point(encoded []byte) (edPoint, error) {
 }
 
 func edPointAdd(p1, p2 edPoint) edPoint {
-	// Edwards25519 (a = -1):
-	// x3 = (x1*y2 + y1*x2) / (1 + d*x1*x2*y1*y2)
-	// y3 = (y1*y2 + x1*x2) / (1 - d*x1*x2*y1*y2)
 	x1y2 := new(big.Int).Mod(new(big.Int).Mul(p1.x, p2.y), edP)
 	y1x2 := new(big.Int).Mod(new(big.Int).Mul(p1.y, p2.x), edP)
 	y1y2 := new(big.Int).Mod(new(big.Int).Mul(p1.y, p2.y), edP)
@@ -1263,17 +1681,13 @@ func validateStrictEd25519PublicKey(pub ed25519.PublicKey) error {
 }
 
 func verifyStrictEd25519Domain(pub ed25519.PublicKey, domain string, data []byte, encodedSig string) error {
-	if len(encodedSig) == 0 || len(encodedSig) > 128 {
-		return fmt.Errorf("invalid signature length")
-	}
-	sig, err := base64.StdEncoding.DecodeString(encodedSig)
+	sig, err := decodeCanonicalStdBase64(encodedSig)
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return fmt.Errorf("invalid base64 signature")
 	}
 	if err := validateStrictEd25519PublicKey(pub); err != nil {
 		return err
 	}
-	// 严格校验 R 点规范编码且非小阶点。
 	rPoint, err := decodeCanonicalEd25519Point(sig[:32])
 	if err != nil {
 		return fmt.Errorf("invalid signature R point: %w", err)
@@ -1281,7 +1695,6 @@ func verifyStrictEd25519Domain(pub ed25519.PublicKey, domain string, data []byte
 	if isSmallOrderEd25519Point(rPoint) {
 		return fmt.Errorf("small-order signature R point rejected")
 	}
-	// 严格校验标量 S < L。
 	var sBE [32]byte
 	for i := 0; i < 32; i++ {
 		sBE[i] = sig[63-i]
@@ -1293,11 +1706,9 @@ func verifyStrictEd25519Domain(pub ed25519.PublicKey, domain string, data []byte
 	msg := make([]byte, 0, len(domain)+len(data))
 	msg = append(msg, domain...)
 	msg = append(msg, data...)
-	// 复用标准库快速验签，同时拒绝非规范点/小阶点后与 verify_strict 保持一致。
 	if !ed25519.Verify(pub, msg, sig) {
 		return fmt.Errorf("ed25519 signature mismatch")
 	}
-	// 验证无余因子等式 [S]B == R + [k]A（排除余因子消去伪造）。
 	h := sha512.New()
 	h.Write(sig[:32])
 	h.Write(pub)
@@ -1322,7 +1733,6 @@ func verifyStrictEd25519Domain(pub ed25519.PublicKey, domain string, data []byte
 }
 
 func edScalarBaseMult(s *big.Int) edPoint {
-	// RFC 8032 base point B: y = 4/5 mod p, x > 0 (even)
 	four := big.NewInt(4)
 	fiveInv := new(big.Int).ModInverse(big.NewInt(5), edP)
 	by := new(big.Int).Mod(new(big.Int).Mul(four, fiveInv), edP)
