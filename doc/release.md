@@ -33,7 +33,7 @@ python3 /root/<候选目录>/deploy.py timserver_1 --candidate /root/<候选目�
 
 每条命令只在对应服务器执行。CSTOA 使用已安装的 Python 3.11，Tim 使用系统 Python；SQLite 在线备份要求 Python 3.7 及以上。脚本要求接收端已有配置和数据库，执行在线一致性备份，保存旧程序及配置，再替换程序、重启遥测服务、验证版本与数据。失败时恢复旧接收端。回退不恢复数据库快照，不覆盖更新期间的有效上传。
 
-CSTOA 的更新不重启 OA 或 nginx。Tim 的更新只操作 `cst-pilot-telemetry` Compose 项目，保留 TLS 私钥和公开 CA。
+CSTOA 的更新不重启 OA 或 nginx，并保持 `/var/lib/cst-releases` 发行包目录与 `telemetry.env` 原样不变。客户端压缩包的托管与发布见[发行包分发设计](release-distribution.md)。Tim 的更新只操作 `cst-pilot-telemetry` Compose 项目，保留 TLS 私钥和公开 CA。
 
 ## 部署确认
 

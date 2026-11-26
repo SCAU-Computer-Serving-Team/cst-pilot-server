@@ -1,11 +1,12 @@
-// 遥测接收端 · 入口。
+// 遥测接收与发行包分发服务端 · 入口。
 //
 // 用法：
 //
-//	cst-pilot-server serve              常驻服务（默认）
-//	cst-pilot-server export-csv [out]   导出会话明细 CSV
-//	cst-pilot-server delete --mid M1024 | --device <id>
-//	cst-pilot-server rollup             手动重算 daily_rollup
+//	cst-pilot-server serve                                常驻服务（默认）
+//	cst-pilot-server export-csv [out]                     导出会话明细 CSV
+//	cst-pilot-server delete --mid M1024 | --device <id>   删除指定遥测记录
+//	cst-pilot-server rollup                               手动重算 daily_rollup
+//	cst-pilot-server release <list|publish|activate|gc>   管理客户端发行压缩包
 //
 // 环境变量：
 //
@@ -15,6 +16,7 @@
 //	OA_INTROSPECT_URL 生产必需的 OA 内省接口
 //	OA_SERVICE_TOKEN  内省服务凭据
 //	TELEMETRY_ALLOW_STUB 测试身份开关，仅本地联调使用
+//	RELEASE_STORAGE_DIR  发行包目录（未设置时关闭发行分发模块）
 package main
 
 import (
@@ -60,15 +62,39 @@ func serve() error {
 	if err := validateAuthOptions(auth); err != nil {
 		return err
 	}
-	// 2G 内存机器：给 GC 一个 24MiB 的软上限，超限时更激进回收而非无限堆积。
-	debug.SetMemoryLimit(24 << 20)
+	relCfg, err := loadReleaseConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	// 纯遥测实例（如 64MiB 容器）维持 24MiB 软上限；启用发行模块时放宽至 48MiB 供流式校验。
+	if relCfg.Enabled {
+		debug.SetMemoryLimit(48 << 20)
+	} else {
+		debug.SetMemoryLimit(24 << 20)
+	}
 
 	st, err := openStore(dbPath)
 	if err != nil {
 		return err
 	}
 	defer st.close()
-	server := newTelemetryServer(serverOptions{store: st, auth: newIntrospector(auth)})
+
+	var relStore *releaseStore
+	var relGuard *releaseGuard
+	if relCfg.Enabled {
+		relStore, err = openReleaseStore(relCfg)
+		if err != nil {
+			return err
+		}
+		defer relStore.close()
+		relGuard = newReleaseGuard(relCfg, nil)
+	}
+	server := newTelemetryServer(serverOptions{
+		store:        st,
+		auth:         newIntrospector(auth),
+		releases:     relStore,
+		releaseGuard: relGuard,
+	})
 
 	daily := func() {
 		if err := st.runRetention(); err != nil {
@@ -157,8 +183,10 @@ func main() {
 		err = deleteCmd(args[1:])
 	case "rollup":
 		err = rollupCmd()
+	case "release":
+		err = releaseCmd(args[1:])
 	default:
-		err = fmt.Errorf("unknown command %q (serve | version | export-csv | delete | rollup)", command)
+		err = fmt.Errorf("unknown command %q (serve | version | export-csv | delete | rollup | release)", command)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
